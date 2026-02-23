@@ -28,6 +28,7 @@ pub struct FatArch {
 
 #[derive(Debug, Clone, Default)]
 pub struct Segment {
+    pub segname: String,
     pub vmaddr: u64,
     pub vmsize: u64,
     pub fileoff: u64,
@@ -37,6 +38,7 @@ pub struct Segment {
 
 #[derive(Debug, Clone, Default)]
 struct Section {
+    pub sectname: String,
     pub addr: u64,
     pub size: u64,
     pub offset: u32,
@@ -115,6 +117,7 @@ pub struct MachO {
     sections: Vec<Section>,
     symbols: Vec<NlistEntry>,
     string_table: Vec<u8>,
+    vmaddr: u64,
 }
 
 impl MachO {
@@ -126,6 +129,7 @@ impl MachO {
             sections: Vec::new(),
             symbols: Vec::new(),
             string_table: Vec::new(),
+            vmaddr: 0,
         };
         macho.stream.is_32bit = is_32bit;
         macho.load()?;
@@ -167,6 +171,11 @@ impl MachO {
                 self.stream.set_position(cmd_pos);
                 let seg = self.read_segment()?;
                 let nsects = seg.nsects;
+
+                if seg.segname == "__TEXT" {
+                    self.vmaddr = seg.vmaddr;
+                }
+
                 self.segments.push(seg);
 
                 for _ in 0..nsects {
@@ -196,7 +205,7 @@ impl MachO {
         }
 
         if cryptid != 0 {
-            eprintln!("Warning: Binary is encrypted");
+            eprintln!("ERROR: This Mach-O executable is encrypted and cannot be processed.");
         }
 
         Ok(())
@@ -205,9 +214,13 @@ impl MachO {
     fn read_segment(&mut self) -> Result<Segment> {
         let _cmd = self.stream.read_u32()?;
         let _cmdsize = self.stream.read_u32()?;
-        let _segname = self.stream.read_bytes(16)?;
+        let segname_bytes = self.stream.read_bytes(16)?;
+        let segname = String::from_utf8_lossy(&segname_bytes)
+            .trim_end_matches('\0')
+            .to_string();
 
         let mut seg = Segment::default();
+        seg.segname = segname;
         if self.is_32bit {
             seg.vmaddr = self.stream.read_u32()? as u64;
             seg.vmsize = self.stream.read_u32()? as u64;
@@ -228,10 +241,14 @@ impl MachO {
     }
 
     fn read_section(&mut self) -> Result<Section> {
-        let _sectname = self.stream.read_bytes(16)?;
+        let sectname_bytes = self.stream.read_bytes(16)?;
+        let sectname = String::from_utf8_lossy(&sectname_bytes)
+            .trim_end_matches('\0')
+            .to_string();
         let _segname = self.stream.read_bytes(16)?;
 
         let mut sect = Section::default();
+        sect.sectname = sectname;
         if self.is_32bit {
             sect.addr = self.stream.read_u32()? as u64;
             sect.size = self.stream.read_u32()? as u64;
@@ -291,6 +308,14 @@ impl MachO {
     }
 
     pub fn map_vatr(&self, addr: u64) -> Result<u64> {
+        for sect in &self.sections {
+            if addr >= sect.addr && addr <= sect.addr + sect.size {
+                if sect.sectname == "__bss" {
+                    return Err(Error::Other("Cannot map __bss section address".into()));
+                }
+                return Ok(addr - sect.addr + sect.offset as u64);
+            }
+        }
         for seg in &self.segments {
             if addr >= seg.vmaddr && addr < seg.vmaddr + seg.vmsize {
                 return Ok(addr - seg.vmaddr + seg.fileoff);
@@ -300,12 +325,41 @@ impl MachO {
     }
 
     pub fn map_rtva(&self, offset: u64) -> u64 {
+        for sect in &self.sections {
+            if offset >= sect.offset as u64 && offset <= sect.offset as u64 + sect.size {
+                if sect.sectname == "__bss" {
+                    return 0;
+                }
+                return offset - sect.offset as u64 + sect.addr;
+            }
+        }
         for seg in &self.segments {
             if offset >= seg.fileoff && offset < seg.fileoff + seg.filesize {
                 return offset - seg.fileoff + seg.vmaddr;
             }
         }
         0
+    }
+
+    pub fn read_uint_ptr(&mut self) -> Result<u64> {
+        if self.is_32bit {
+            return Ok(self.stream.read_u32()? as u64);
+        }
+        let pointer = self.stream.read_u64()?;
+        if pointer > self.vmaddr + 0xFFFFFFFF {
+            let addr = self.stream.position();
+            for sect in &self.sections {
+                if addr >= sect.offset as u64 && addr <= sect.offset as u64 + sect.size {
+                    if sect.sectname == "__const" || sect.sectname == "__data" {
+                        let rva = pointer - self.vmaddr;
+                        let masked = rva & 0xFFFFFFFF;
+                        return Ok(masked + self.vmaddr);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(pointer)
     }
 
     pub fn symbol_search(&self) -> Option<(u64, u64)> {
@@ -328,9 +382,190 @@ impl MachO {
         }
     }
 
+    pub fn search_mod_init_func(&mut self, version: f64) -> Option<(u64, u64)> {
+        let mod_init = self.sections.iter()
+            .find(|s| s.sectname == "__mod_init_func")?
+            .clone();
+
+        if self.is_32bit {
+            self.search_32bit(&mod_init, version)
+        } else {
+            self.search_64bit(&mod_init, version)
+        }
+    }
+
+    fn search_32bit(&mut self, mod_init: &Section, version: f64) -> Option<(u64, u64)> {
+        let feature_bytes_1: [u8; 2] = [0x0, 0x22]; // MOVS R2, #0
+        let feature_bytes_2: [u8; 4] = [0x78, 0x44, 0x79, 0x44]; // ADD R0, PC; ADD R1, PC
+
+        let count = (mod_init.size / 4) as usize;
+        self.stream.set_position(mod_init.offset as u64);
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            addrs.push(self.stream.read_u32().unwrap_or(0) as u64);
+        }
+
+        for a in &addrs {
+            if *a == 0 { continue; }
+            let i = *a - 1; // ARM Thumb bit
+            if let Ok(mapped) = self.map_vatr(i) {
+                self.stream.set_position(mapped + 4);
+                let buff = self.stream.read_bytes(2).unwrap_or_default();
+                if buff == feature_bytes_1 {
+                    self.stream.set_position(mapped + 18);
+                    let buff2 = self.stream.read_bytes(4).unwrap_or_default();
+                    if buff2 == feature_bytes_2 {
+                        self.stream.set_position(mapped + 10);
+                        let mov_bytes = self.stream.read_bytes(8).unwrap_or_default();
+                        let subaddr = decode_mov_arm32(&mov_bytes).wrapping_add(i + 24 - 1);
+                        if let Ok(rsubaddr) = self.map_vatr(subaddr) {
+                            self.stream.set_position(rsubaddr);
+                            let mov_bytes2 = self.stream.read_bytes(8).unwrap_or_default();
+                            let ptr = decode_mov_arm32(&mov_bytes2).wrapping_add(subaddr + 16);
+                            if let Ok(ptr_offset) = self.map_vatr(ptr) {
+                                self.stream.set_position(ptr_offset);
+                                let metadata_registration = self.stream.read_u32().unwrap_or(0) as u64;
+
+                                self.stream.set_position(rsubaddr + 8);
+                                let buff3 = self.stream.read_bytes(4).unwrap_or_default();
+                                self.stream.set_position(rsubaddr + 14);
+                                let buff4 = self.stream.read_bytes(4).unwrap_or_default();
+                                let combined: Vec<u8> = buff3.iter().chain(buff4.iter()).cloned().collect();
+
+                                let code_extra = if version < 21.0 { 22u64 } else { 26u64 };
+                                let code_registration = decode_mov_arm32(&combined).wrapping_add(subaddr + code_extra);
+
+                                return Some((code_registration, metadata_registration));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn search_64bit(&mut self, mod_init: &Section, version: f64) -> Option<(u64, u64)> {
+        let feature_bytes_1: [u8; 4] = [0x2, 0x0, 0x80, 0xD2]; // MOV X2, #0
+        let feature_bytes_2: [u8; 4] = [0x3, 0x0, 0x80, 0x52]; // MOV W3, #0
+
+        let count = (mod_init.size / 8) as usize;
+        self.stream.set_position(mod_init.offset as u64);
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            addrs.push(self.stream.read_u64().unwrap_or(0));
+        }
+
+        let code_registration = 0u64;
+        let metadata_registration = 0u64;
+
+        for i in &addrs {
+            if *i == 0 { continue; }
+            let mapped = match self.map_vatr(*i) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if version < 23.0 {
+                // v<23: FeatureBytes1 then FeatureBytes2, OR vice versa
+                self.stream.set_position(mapped);
+                let buff = self.stream.read_bytes(4).unwrap_or_default();
+                if buff == feature_bytes_1 {
+                    let buff2 = self.stream.read_bytes(4).unwrap_or_default();
+                    if buff2 == feature_bytes_2 {
+                        self.stream.set_position(mapped + 16);
+                        let inst = self.stream.read_bytes(4).unwrap_or_default();
+                        if is_adr(&inst) {
+                            let subaddr = decode_adr(*i + 16, &inst);
+                            if let Some(result) = self.resolve_adrp_pair(*i, subaddr) {
+                                return Some(result);
+                            }
+                        }
+                    }
+                } else {
+                    self.stream.set_position(mapped + 0x10);
+                    let buff2 = self.stream.read_bytes(4).unwrap_or_default();
+                    if buff2 == feature_bytes_2 {
+                        let buff3 = self.stream.read_bytes(4).unwrap_or_default();
+                        if buff3 == feature_bytes_1 {
+                            self.stream.set_position(mapped + 8);
+                            let inst = self.stream.read_bytes(4).unwrap_or_default();
+                            if is_adr(&inst) {
+                                let subaddr = decode_adr(*i + 8, &inst);
+                                if let Some(result) = self.resolve_adrp_pair(*i, subaddr) {
+                                    return Some(result);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if version >= 23.0 && version < 24.0 {
+                // v==23: offset+16 has FeatureBytes1 then FeatureBytes2
+                self.stream.set_position(mapped + 16);
+                let buff = self.stream.read_bytes(4).unwrap_or_default();
+                if buff == feature_bytes_1 {
+                    let buff2 = self.stream.read_bytes(4).unwrap_or_default();
+                    if buff2 == feature_bytes_2 {
+                        self.stream.set_position(mapped + 8);
+                        let inst = self.stream.read_bytes(4).unwrap_or_default();
+                        let subaddr = decode_adr(*i + 8, &inst);
+                        if let Some(result) = self.resolve_adrp_pair(*i, subaddr) {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+
+            if version >= 24.0 {
+                // v>=24: offset+16 has FeatureBytes2 then FeatureBytes1 (swapped)
+                self.stream.set_position(mapped + 16);
+                let buff = self.stream.read_bytes(4).unwrap_or_default();
+                if buff == feature_bytes_2 {
+                    let buff2 = self.stream.read_bytes(4).unwrap_or_default();
+                    if buff2 == feature_bytes_1 {
+                        self.stream.set_position(mapped + 8);
+                        let inst = self.stream.read_bytes(4).unwrap_or_default();
+                        let subaddr = decode_adr(*i + 8, &inst);
+                        if let Some(result) = self.resolve_adrp_pair(*i, subaddr) {
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+        }
+
+        if code_registration != 0 && metadata_registration != 0 {
+            Some((code_registration, metadata_registration))
+        } else {
+            None
+        }
+    }
+
+    fn resolve_adrp_pair(&mut self, _base_addr: u64, subaddr: u64) -> Option<(u64, u64)> {
+        let rsubaddr = self.map_vatr(subaddr).ok()?;
+        self.stream.set_position(rsubaddr);
+        let adrp_bytes = self.stream.read_bytes(4).unwrap_or_default();
+        let add_bytes = self.stream.read_bytes(4).unwrap_or_default();
+        let code_registration = decode_adrp(subaddr, &adrp_bytes) + decode_add(&add_bytes);
+
+        self.stream.set_position(rsubaddr + 8);
+        let adrp_bytes2 = self.stream.read_bytes(4).unwrap_or_default();
+        let add_bytes2 = self.stream.read_bytes(4).unwrap_or_default();
+        let metadata_registration = decode_adrp(subaddr + 8, &adrp_bytes2) + decode_add(&add_bytes2);
+
+        if code_registration != 0 && metadata_registration != 0 {
+            Some((code_registration, metadata_registration))
+        } else {
+            None
+        }
+    }
+
     pub fn get_section_helper(&self, method_count: usize, type_definitions_count: usize, metadata_usages_count: usize, image_count: usize, version: f64) -> SectionHelper<'_> {
         let mut data_list = Vec::new();
         let mut exec_list = Vec::new();
+        let mut bss_list = Vec::new();
         let mut all_sections = Vec::new();
 
         for sect in &self.sections {
@@ -343,15 +578,20 @@ impl MachO {
 
             all_sections.push(search_section.clone());
 
-            if (sect.flags & S_ATTR_PURE_INSTRUCTIONS) != 0 ||
-               (sect.flags & S_ATTR_SOME_INSTRUCTIONS) != 0 {
+            if sect.flags == (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) {
                 exec_list.push(search_section);
+            } else if sect.flags == 1 {
+                bss_list.push(search_section);
+            } else if self.is_32bit {
+                if sect.sectname == "__const" {
+                    data_list.push(search_section);
+                }
             } else {
-                data_list.push(search_section);
+                if sect.sectname == "__const" || sect.sectname == "__cstring" || sect.sectname == "__data" {
+                    data_list.push(search_section);
+                }
             }
         }
-
-        let bss = data_list.clone();
 
         SectionHelper::new(
             self.stream.data(),
@@ -360,7 +600,7 @@ impl MachO {
             all_sections,
             data_list,
             exec_list,
-            bss,
+            bss_list,
             method_count,
             type_definitions_count,
             metadata_usages_count,
@@ -373,6 +613,68 @@ impl MachO {
     }
 
     pub fn get_rva(&self, pointer: u64) -> u64 {
-        pointer
+        pointer - self.vmaddr
     }
+}
+
+fn is_adr(inst: &[u8]) -> bool {
+    if inst.len() < 4 { return false; }
+    let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
+    (value & 0x9F000000) == 0x10000000
+}
+
+fn decode_adr(pc: u64, inst: &[u8]) -> u64 {
+    if inst.len() < 4 { return 0; }
+    let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
+    let immhi = ((value >> 5) & 0x7FFFF) as i64;
+    let immlo = ((value >> 29) & 0x3) as i64;
+    let imm = (immhi << 2) | immlo;
+    let sign_extended = if imm & (1 << 20) != 0 {
+        imm | !0xFFFFF // sign extend 21-bit
+    } else {
+        imm
+    };
+    (pc as i64 + sign_extended) as u64
+}
+
+fn decode_adrp(pc: u64, inst: &[u8]) -> u64 {
+    if inst.len() < 4 { return 0; }
+    let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
+    let immhi = ((value >> 5) & 0x7FFFF) as i64;
+    let immlo = ((value >> 29) & 0x3) as i64;
+    let imm = ((immhi << 2) | immlo) << 12;
+    let sign_extended = if imm & (1i64 << 32) != 0 {
+        imm | !0xFFFFFFFF
+    } else {
+        imm
+    };
+    ((pc as i64 & !0xFFF) + sign_extended) as u64
+}
+
+fn decode_add(inst: &[u8]) -> u64 {
+    if inst.len() < 4 { return 0; }
+    let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
+    let imm12 = (value >> 10) & 0xFFF;
+    let shift = (value >> 22) & 0x3;
+    if shift == 1 {
+        (imm12 << 12) as u64
+    } else {
+        imm12 as u64
+    }
+}
+
+fn decode_mov_arm32(data: &[u8]) -> u64 {
+    if data.len() < 4 { return 0; }
+    let low = u16::from_le_bytes([data[0], data[1]]);
+    let high = if data.len() >= 4 {
+        u16::from_le_bytes([data[2], data[3]])
+    } else {
+        0
+    };
+    let imm8 = (low & 0xFF) as u32;
+    let imm3 = ((low >> 12) & 0x7) as u32;
+    let i = ((high >> 10) & 0x1) as u32;
+    let imm4 = (high & 0xF) as u32;
+    let result = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+    result as u64
 }

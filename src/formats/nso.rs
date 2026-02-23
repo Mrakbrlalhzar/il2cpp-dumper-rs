@@ -1,52 +1,220 @@
 use crate::io::BinaryStream;
 use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
+use crate::formats::elf::{
+    ElfDyn, ElfSym,
+    DT_HASH, DT_GNU_HASH, DT_SYMTAB, DT_RELA, DT_RELASZ,
+    R_AARCH64_ABS64, R_AARCH64_RELATIVE,
+};
 
 pub const NSO_MAGIC: u32 = 0x304F534E;
+
+#[derive(Clone)]
+struct NsoSegment {
+    file_offset: u64,
+    memory_offset: u64,
+    decompressed_size: u64,
+}
 
 pub struct Nso {
     pub stream: BinaryStream,
     pub is_32bit: bool,
-    text_start: u64,
-    text_end: u64,
-    rodata_start: u64,
-    rodata_end: u64,
-    data_start: u64,
-    data_end: u64,
-    bss_size: u64,
-    bss_end: u64,
+    segments: Vec<NsoSegment>,
+    bss_segment: Option<NsoSegment>,
 }
 
 impl Nso {
     pub fn new(data: Vec<u8>) -> Result<Self> {
         let header = Self::parse_header(&data)?;
+        let is_compressed = (header.flags & 7) != 0;
         let decompressed = Self::decompress_if_needed(&data, &header)?;
 
-        let text_start = header.text_memory_offset as u64;
-        let text_end = text_start + header.text_decompressed_size as u64;
-        let rodata_start = header.rodata_memory_offset as u64;
-        let rodata_end = rodata_start + header.rodata_decompressed_size as u64;
-        let data_start = header.data_memory_offset as u64;
-        let data_end = data_start + header.data_decompressed_size as u64;
-        let bss_size = header.bss_size as u64;
-        let bss_end = data_end + bss_size;
+        let text_seg = NsoSegment {
+            file_offset: header.text_file_offset as u64,
+            memory_offset: header.text_memory_offset as u64,
+            decompressed_size: header.text_decompressed_size as u64,
+        };
+        let rodata_seg = NsoSegment {
+            file_offset: header.rodata_file_offset as u64,
+            memory_offset: header.rodata_memory_offset as u64,
+            decompressed_size: header.rodata_decompressed_size as u64,
+        };
+        let data_seg = NsoSegment {
+            file_offset: header.data_file_offset as u64,
+            memory_offset: header.data_memory_offset as u64,
+            decompressed_size: header.data_decompressed_size as u64,
+        };
 
-        Ok(Self {
+        let segments = vec![text_seg.clone(), rodata_seg.clone(), data_seg.clone()];
+
+        let mut nso = Self {
             stream: BinaryStream::new(decompressed),
             is_32bit: false,
-            text_start,
-            text_end,
-            rodata_start,
-            rodata_end,
-            data_start,
-            data_end,
-            bss_size,
-            bss_end,
-        })
+            segments,
+            bss_segment: None,
+        };
+
+        if !is_compressed {
+            nso.read_mod0_and_dynamic(&header)?;
+        }
+
+        Ok(nso)
+    }
+
+    fn read_mod0_and_dynamic(&mut self, header: &NsoHeader) -> Result<()> {
+        self.stream.set_position(header.text_file_offset as u64 + 4);
+        let mod_offset = self.stream.read_u32()? as u64;
+
+        self.stream.set_position(header.text_file_offset as u64 + mod_offset + 4);
+        let dynamic_offset = self.stream.read_u32()? as u64 + mod_offset;
+        let bss_start = self.stream.read_u32()? as u64;
+        let bss_end = self.stream.read_u32()? as u64;
+
+        self.bss_segment = Some(NsoSegment {
+            file_offset: bss_start,
+            memory_offset: bss_start,
+            decompressed_size: bss_end - bss_start,
+        });
+
+        let data_end = header.data_memory_offset as u64 + header.data_decompressed_size as u64;
+        let max_entries = ((data_end - dynamic_offset) / 16) as usize;
+
+        let dyn_file_offset = self.map_vatr(dynamic_offset)?;
+        self.stream.set_position(dyn_file_offset);
+
+        let mut dynamic_section: Vec<ElfDyn> = Vec::new();
+        for _ in 0..max_entries {
+            let d_tag = self.stream.read_i64()?;
+            let d_un = self.stream.read_u64()?;
+            if d_tag == 0 { break; }
+            dynamic_section.push(ElfDyn { d_tag, d_un });
+        }
+
+        let symbol_table = self.read_symbols(&dynamic_section)?;
+        self.process_relocations(&dynamic_section, &symbol_table)?;
+
+        Ok(())
+    }
+
+    fn read_symbols(&mut self, dynamic_section: &[ElfDyn]) -> Result<Vec<ElfSym>> {
+        let symbol_count = self.get_symbol_count(dynamic_section)?;
+        let dynsym_entry = dynamic_section.iter().find(|d| d.d_tag == DT_SYMTAB);
+        let dynsym_addr = match dynsym_entry {
+            Some(e) => e.d_un,
+            None => return Ok(Vec::new()),
+        };
+
+        let dynsym_offset = self.map_vatr(dynsym_addr)?;
+        self.stream.set_position(dynsym_offset);
+
+        let mut symbols = Vec::with_capacity(symbol_count);
+        for _ in 0..symbol_count {
+            let st_name = self.stream.read_u32()?;
+            let st_info = self.stream.read_u8()?;
+            let st_other = self.stream.read_u8()?;
+            let st_shndx = self.stream.read_u16()?;
+            let st_value = self.stream.read_u64()?;
+            let st_size = self.stream.read_u64()?;
+            symbols.push(ElfSym { st_name, st_info, st_other, st_shndx, st_value, st_size });
+        }
+
+        Ok(symbols)
+    }
+
+    fn get_symbol_count(&mut self, dynamic_section: &[ElfDyn]) -> Result<usize> {
+        if let Some(hash_entry) = dynamic_section.iter().find(|d| d.d_tag == DT_HASH) {
+            let addr = self.map_vatr(hash_entry.d_un)?;
+            self.stream.set_position(addr);
+            let _nbucket = self.stream.read_u32()?;
+            let nchain = self.stream.read_u32()?;
+            return Ok(nchain as usize);
+        }
+
+        if let Some(gnu_hash) = dynamic_section.iter().find(|d| d.d_tag == DT_GNU_HASH) {
+            let addr = self.map_vatr(gnu_hash.d_un)?;
+            self.stream.set_position(addr);
+            let nbuckets = self.stream.read_u32()?;
+            let symoffset = self.stream.read_u32()?;
+            let bloom_size = self.stream.read_u32()?;
+            let _bloom_shift = self.stream.read_u32()?;
+            let buckets_address = addr + 16 + (8 * bloom_size as u64);
+
+            self.stream.set_position(buckets_address);
+            let mut last_symbol = 0u32;
+            for _ in 0..nbuckets {
+                let bucket = self.stream.read_u32()?;
+                if bucket > last_symbol { last_symbol = bucket; }
+            }
+
+            if last_symbol < symoffset {
+                return Ok(symoffset as usize);
+            }
+
+            let chains_base = buckets_address + 4 * nbuckets as u64;
+            self.stream.set_position(chains_base + (last_symbol - symoffset) as u64 * 4);
+            loop {
+                let chain_entry = self.stream.read_u32()?;
+                last_symbol += 1;
+                if (chain_entry & 1) != 0 { break; }
+            }
+            return Ok(last_symbol as usize);
+        }
+
+        Ok(0)
+    }
+
+    fn process_relocations(&mut self, dynamic_section: &[ElfDyn], symbol_table: &[ElfSym]) -> Result<()> {
+        let rela_entry = match dynamic_section.iter().find(|d| d.d_tag == DT_RELA) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let relasz_entry = match dynamic_section.iter().find(|d| d.d_tag == DT_RELASZ) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        let rela_offset = self.map_vatr(rela_entry.d_un)?;
+        let rela_count = relasz_entry.d_un / 24;
+
+        println!("Applying relocations...");
+
+        self.stream.set_position(rela_offset);
+        let mut rela_entries = Vec::with_capacity(rela_count as usize);
+        for _ in 0..rela_count {
+            let r_offset = self.stream.read_u64()?;
+            let r_info = self.stream.read_u64()?;
+            let r_addend = self.stream.read_i64()?;
+            rela_entries.push((r_offset, r_info, r_addend));
+        }
+
+        for (r_offset, r_info, r_addend) in &rela_entries {
+            let rel_type = (*r_info & 0xFFFFFFFF) as u32;
+            let sym_idx = (*r_info >> 32) as usize;
+
+            match rel_type {
+                R_AARCH64_ABS64 => {
+                    if sym_idx < symbol_table.len() {
+                        let symbol = &symbol_table[sym_idx];
+                        let write_offset = self.map_vatr(*r_offset)?;
+                        let value = symbol.st_value.wrapping_add(*r_addend as u64);
+                        self.stream.set_position(write_offset);
+                        self.stream.write_u64(value)?;
+                    }
+                }
+                R_AARCH64_RELATIVE => {
+                    let write_offset = self.map_vatr(*r_offset)?;
+                    self.stream.set_position(write_offset);
+                    self.stream.write_u64(*r_addend as u64)?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     fn parse_header(data: &[u8]) -> Result<NsoHeader> {
-        if data.len() < 0x70 {
+        if data.len() < 0x100 {
             return Err(Error::InvalidFormat("NSO header too small".into()));
         }
 
@@ -55,21 +223,23 @@ impl Nso {
             return Err(Error::InvalidFormat("Invalid NSO magic".into()));
         }
 
+        let r = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+
         Ok(NsoHeader {
-            flags: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            text_file_offset: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            text_memory_offset: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            text_decompressed_size: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-            rodata_file_offset: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            rodata_memory_offset: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
-            rodata_decompressed_size: u32::from_le_bytes([data[40], data[41], data[42], data[43]]),
-            data_file_offset: u32::from_le_bytes([data[48], data[49], data[50], data[51]]),
-            data_memory_offset: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
-            data_decompressed_size: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            bss_size: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            text_compressed_size: u32::from_le_bytes([data[0x60], data[0x61], data[0x62], data[0x63]]),
-            rodata_compressed_size: u32::from_le_bytes([data[0x64], data[0x65], data[0x66], data[0x67]]),
-            data_compressed_size: u32::from_le_bytes([data[0x68], data[0x69], data[0x6A], data[0x6B]]),
+            flags: r(12),
+            text_file_offset: r(16),
+            text_memory_offset: r(20),
+            text_decompressed_size: r(24),
+            rodata_file_offset: r(32),
+            rodata_memory_offset: r(36),
+            rodata_decompressed_size: r(40),
+            data_file_offset: r(48),
+            data_memory_offset: r(52),
+            data_decompressed_size: r(56),
+            bss_size: r(60),
+            text_compressed_size: r(0x60),
+            rodata_compressed_size: r(0x64),
+            data_compressed_size: r(0x68),
         })
     }
 
@@ -86,12 +256,21 @@ impl Nso {
             header.data_decompressed_size as usize +
             header.bss_size as usize;
 
-        let mut result = vec![0u8; total_size];
+        let mut result = vec![0u8; total_size.max(0x100)];
+        result[..0x100.min(data.len())].copy_from_slice(&data[..0x100.min(data.len())]);
+
+        let new_ro_offset = header.text_file_offset + header.text_decompressed_size;
+        let new_data_offset = new_ro_offset + header.rodata_decompressed_size;
+
+        result[16..20].copy_from_slice(&header.text_file_offset.to_le_bytes());
+        result[32..36].copy_from_slice(&new_ro_offset.to_le_bytes());
+        result[48..52].copy_from_slice(&new_data_offset.to_le_bytes());
+        result[12..16].copy_from_slice(&0u32.to_le_bytes());
 
         Self::decompress_segment(
             data, &mut result,
             header.text_file_offset as usize,
-            header.text_memory_offset as usize,
+            header.text_file_offset as usize,
             header.text_decompressed_size as usize,
             header.text_compressed_size as usize,
             text_compressed,
@@ -100,7 +279,7 @@ impl Nso {
         Self::decompress_segment(
             data, &mut result,
             header.rodata_file_offset as usize,
-            header.rodata_memory_offset as usize,
+            new_ro_offset as usize,
             header.rodata_decompressed_size as usize,
             header.rodata_compressed_size as usize,
             rodata_compressed,
@@ -109,7 +288,7 @@ impl Nso {
         Self::decompress_segment(
             data, &mut result,
             header.data_file_offset as usize,
-            header.data_memory_offset as usize,
+            new_data_offset as usize,
             header.data_decompressed_size as usize,
             header.data_compressed_size as usize,
             data_compressed,
@@ -122,7 +301,7 @@ impl Nso {
         src: &[u8],
         dst: &mut [u8],
         file_offset: usize,
-        memory_offset: usize,
+        dest_offset: usize,
         decompressed_size: usize,
         compressed_size: usize,
         is_compressed: bool,
@@ -135,25 +314,35 @@ impl Nso {
             let compressed = &src[file_offset..end];
             let decompressed = lz4_flex::decompress(compressed, decompressed_size)
                 .map_err(|e| Error::InvalidFormat(format!("LZ4 decompression failed: {}", e)))?;
-            let copy_len = std::cmp::min(decompressed.len(), dst.len().saturating_sub(memory_offset));
-            dst[memory_offset..memory_offset + copy_len].copy_from_slice(&decompressed[..copy_len]);
+            let copy_len = std::cmp::min(decompressed.len(), dst.len().saturating_sub(dest_offset));
+            dst[dest_offset..dest_offset + copy_len].copy_from_slice(&decompressed[..copy_len]);
         } else {
             let end = file_offset + decompressed_size;
             if end > src.len() {
                 return Err(Error::InvalidFormat("Uncompressed segment out of bounds".into()));
             }
-            let copy_len = std::cmp::min(decompressed_size, dst.len().saturating_sub(memory_offset));
-            dst[memory_offset..memory_offset + copy_len].copy_from_slice(&src[file_offset..file_offset + copy_len]);
+            let copy_len = std::cmp::min(decompressed_size, dst.len().saturating_sub(dest_offset));
+            dst[dest_offset..dest_offset + copy_len].copy_from_slice(&src[file_offset..file_offset + copy_len]);
         }
         Ok(())
     }
 
     pub fn map_vatr(&self, addr: u64) -> Result<u64> {
-        Ok(addr)
+        for seg in &self.segments {
+            if addr >= seg.memory_offset && addr <= seg.memory_offset + seg.decompressed_size {
+                return Ok(addr - seg.memory_offset + seg.file_offset);
+            }
+        }
+        Err(Error::AddressNotMapped(addr))
     }
 
-    pub fn map_rtva(&self, addr: u64) -> u64 {
-        addr
+    pub fn map_rtva(&self, offset: u64) -> u64 {
+        for seg in &self.segments {
+            if offset >= seg.file_offset && offset <= seg.file_offset + seg.decompressed_size {
+                return offset - seg.file_offset + seg.memory_offset;
+            }
+        }
+        0
     }
 
     pub fn get_section_helper(&self, method_count: usize, type_definitions_count: usize, metadata_usages_count: usize, image_count: usize, version: f64) -> SectionHelper<'_> {
@@ -162,22 +351,27 @@ impl Nso {
         let mut bss_list = Vec::new();
         let mut all = Vec::new();
 
-        let text = SearchSection::new(self.text_start, self.text_end, self.text_start, self.text_end);
-        all.push(text.clone());
-        exec_list.push(text);
+        if self.segments.len() >= 3 {
+            let text = &self.segments[0];
+            let s = SearchSection::new(text.file_offset, text.file_offset + text.decompressed_size, text.memory_offset, text.memory_offset + text.decompressed_size);
+            all.push(s.clone());
+            exec_list.push(s);
 
-        let rodata = SearchSection::new(self.rodata_start, self.rodata_end, self.rodata_start, self.rodata_end);
-        all.push(rodata.clone());
-        data_list.push(rodata);
+            let rodata = &self.segments[1];
+            let s = SearchSection::new(rodata.file_offset, rodata.file_offset + rodata.decompressed_size, rodata.memory_offset, rodata.memory_offset + rodata.decompressed_size);
+            all.push(s.clone());
+            data_list.push(s);
 
-        let data_sec = SearchSection::new(self.data_start, self.data_end, self.data_start, self.data_end);
-        all.push(data_sec.clone());
-        data_list.push(data_sec);
+            let data_seg = &self.segments[2];
+            let s = SearchSection::new(data_seg.file_offset, data_seg.file_offset + data_seg.decompressed_size, data_seg.memory_offset, data_seg.memory_offset + data_seg.decompressed_size);
+            all.push(s.clone());
+            data_list.push(s);
+        }
 
-        if self.bss_size > 0 {
-            let bss = SearchSection::new(self.data_end, self.bss_end, self.data_end, self.bss_end);
-            all.push(bss.clone());
-            bss_list.push(bss);
+        if let Some(bss) = &self.bss_segment {
+            let s = SearchSection::new(bss.file_offset, bss.file_offset + bss.decompressed_size, bss.memory_offset, bss.memory_offset + bss.decompressed_size);
+            all.push(s.clone());
+            bss_list.push(s);
         }
 
         let bss = if bss_list.is_empty() { data_list.clone() } else { bss_list };

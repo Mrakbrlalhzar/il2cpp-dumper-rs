@@ -571,7 +571,7 @@ impl Il2CppExecutor {
         None
     }
 
-    fn get_generic_parameter_from_type(
+    pub fn get_generic_parameter_from_type(
         &self,
         il2cpp_type: &Il2CppType,
         metadata: &Metadata,

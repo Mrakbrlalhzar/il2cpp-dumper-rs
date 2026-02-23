@@ -131,6 +131,16 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     }
 
     if !found {
+        if let Some((cr, mr)) = elf.search_arm32(version) {
+            println!("Found via ARM32 Search");
+            println!("CodeRegistration : 0x{cr:x}");
+            println!("MetadataRegistration : 0x{mr:x}");
+            elf.init(cr, mr)?;
+            found = true;
+        }
+    }
+
+    if !found {
         println!("ERROR: Can't use auto mode to process file, try manual mode.");
         let (cr, mr) = prompt_manual_addresses()?;
         elf.init(cr, mr)?;
@@ -246,6 +256,16 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
     }
 
     if cr_addr == 0 || mr_addr == 0 {
+        if let Some((cr, mr)) = macho.search_mod_init_func(version) {
+            println!("Found via __mod_init_func search");
+            println!("CodeRegistration : 0x{cr:x}");
+            println!("MetadataRegistration : 0x{mr:x}");
+            cr_addr = cr;
+            mr_addr = mr;
+        }
+    }
+
+    if cr_addr == 0 || mr_addr == 0 {
         let mut helper = macho.get_section_helper(method_count, type_count, mu_count, image_count, version);
         let code_reg = helper.find_code_registration();
         let metadata_reg = helper.find_metadata_registration();
@@ -275,6 +295,16 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
     let mut il2cpp = Il2Cpp::new(macho.stream.clone(), version, macho.is_32bit);
     il2cpp.va_segments = va_segments;
     il2cpp.init(cr_addr, mr_addr, &|addr| macho.map_vatr(addr))?;
+
+    if macho.is_32bit {
+        for ptr in il2cpp.method_pointers.iter_mut() {
+            if *ptr > 0 { *ptr -= 1; }
+        }
+        for ptr in il2cpp.custom_attribute_generators.iter_mut() {
+            if *ptr > 0 { *ptr -= 1; }
+        }
+    }
+
     Ok(il2cpp)
 }
 

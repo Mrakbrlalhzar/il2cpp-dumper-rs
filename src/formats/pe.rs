@@ -242,11 +242,10 @@ impl Pe {
 
             all_sections.push(search_section.clone());
 
-            if (section.characteristics & IMAGE_SCN_CNT_CODE) != 0 ||
-               (section.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
-                exec_list.push(search_section);
-            } else {
-                data_list.push(search_section);
+            match section.characteristics {
+                0x60000020 => exec_list.push(search_section),
+                0x40000040 | 0xC0000040 => data_list.push(search_section),
+                _ => {}
             }
         }
 
@@ -268,7 +267,20 @@ impl Pe {
     }
 
     pub fn check_dump(&self) -> bool {
-        self.sections.iter().all(|s| s.pointer_to_raw_data == s.virtual_address)
+        if self.is_32bit {
+            self.image_base != 0x10000000
+        } else {
+            self.image_base != 0x180000000
+        }
+    }
+
+    pub fn load_from_memory(&mut self, addr: u64) {
+        self.image_base = addr;
+        self.stream.image_base = addr;
+        for section in &mut self.sections {
+            section.pointer_to_raw_data = section.virtual_address;
+            section.size_of_raw_data = section.virtual_size;
+        }
     }
 
     pub fn get_rva(&self, pointer: u64) -> u64 {

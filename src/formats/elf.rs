@@ -550,7 +550,7 @@ impl Elf {
         let mut all_sections = Vec::new();
 
         for phdr in &self.segments {
-            if phdr.p_type == PT_LOAD && phdr.p_memsz != 0 {
+            if phdr.p_memsz != 0 {
                 let section = SearchSection::new(
                     phdr.p_offset,
                     phdr.p_offset + phdr.p_filesz,
@@ -560,10 +560,10 @@ impl Elf {
 
                 all_sections.push(section.clone());
 
-                if (phdr.p_flags & PF_X) != 0 {
-                    exec_list.push(section);
-                } else {
-                    data_list.push(section);
+                match phdr.p_flags {
+                    1 | 3 | 5 | 7 => exec_list.push(section),
+                    2 | 4 | 6 => data_list.push(section),
+                    _ => {}
                 }
             }
         }
@@ -637,6 +637,7 @@ impl Elf {
 
     pub fn check_protection(&mut self) -> bool {
         if self.find_dynamic_entry(DT_INIT).is_some() {
+            println!("WARNING: find .init_proc");
             return true;
         }
 
@@ -645,11 +646,17 @@ impl Elf {
                 for sym in &self.symbols {
                     if let Ok(name) = self.stream.read_string_to_null_at(dynstr_offset + sym.st_name as u64) {
                         if name == "JNI_OnLoad" {
+                            println!("WARNING: find JNI_OnLoad");
                             return true;
                         }
                     }
                 }
             }
+        }
+
+        if self.sections.iter().any(|s| s.sh_type == SHT_LOUSER) {
+            println!("WARNING: find SHT_LOUSER section");
+            return true;
         }
 
         false
@@ -947,5 +954,87 @@ impl Elf {
         }
 
         Ok(false)
+    }
+
+    /// ARM32 pattern search from __mod_init_func / executable segments.
+    /// Matches the C# Elf.Search() method for 32-bit ARM ELFs.
+    pub fn search_arm32(&mut self, version: f64) -> Option<(u64, u64)> {
+        if self.header.e_machine != EM_ARM || !self.is_32bit {
+            return None;
+        }
+
+        let got = self.find_dynamic_entry(DT_PLTGOT)?.d_un;
+
+        let exec_segments: Vec<(u64, u64)> = self.segments.iter()
+            .filter(|p| p.p_type == PT_LOAD && (p.p_flags & PF_X) != 0)
+            .map(|p| (p.p_offset, p.p_filesz))
+            .collect();
+
+        // ARM feature bytes pattern:
+        // ? 0x10 ? 0xE7  (LDR R1, [X])
+        // ? 0x00 ? 0xE0  (ADD R0, X, X)
+        // ? 0x20 ? 0xE0  (ADD R2, X, X)
+        let pattern: [(usize, u8); 6] = [
+            (1, 0x10), (3, 0xE7),
+            (5, 0x00), (7, 0xE0),
+            (9, 0x20), (11, 0xE0),
+        ];
+
+        let mut results: Vec<u64> = Vec::new();
+
+        for (seg_offset, seg_size) in &exec_segments {
+            self.stream.set_position(*seg_offset);
+            let buff = match self.stream.read_bytes(*seg_size as usize) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            for i in 0..buff.len().saturating_sub(12) {
+                let mut matched = true;
+                for &(off, val) in &pattern {
+                    if i + off >= buff.len() || buff[i + off] != val {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    // Check LDR bit (byte[2] bit 4 must be 1)
+                    let hex_char = buff[i + 2];
+                    let bit3 = (hex_char >> 4) & 1;
+                    if bit3 == 1 {
+                        results.push(i as u64);
+                    }
+                }
+            }
+        }
+
+        if results.len() != 1 {
+            return None;
+        }
+
+        let result = results[0] as u32;
+        let image_base = self.stream.image_base as u32;
+
+        if version < 24.0 {
+            self.stream.set_position(result as u64 + 0x14);
+            let code_registration = self.stream.read_u32().ok()? as u64 + got;
+            self.stream.set_position(result as u64 + 0x18);
+            let ptr = self.stream.read_u32().ok()? as u64 + got;
+            let ptr_offset = self.map_vatr(ptr).ok()?;
+            self.stream.set_position(ptr_offset);
+            let metadata_registration = self.stream.read_u32().ok()? as u64;
+            Some((code_registration, metadata_registration))
+        } else {
+            // version >= 24
+            self.stream.set_position(result as u64 + 0x14);
+            let code_registration = self.stream.read_u32().ok()? as u64
+                + result as u64 + 0xC + image_base as u64;
+            self.stream.set_position(result as u64 + 0x10);
+            let ptr = self.stream.read_u32().ok()? as u64 + result as u64 + 0x8;
+            let ptr_offset = self.map_vatr(ptr + image_base as u64).ok()?;
+            self.stream.set_position(ptr_offset);
+            let metadata_registration = self.stream.read_u32().ok()? as u64;
+            Some((code_registration, metadata_registration))
+        }
     }
 }

@@ -44,6 +44,9 @@ pub struct Il2Cpp {
     type_dic: HashMap<u64, usize>,
     pub va_segments: Vec<VaSegment>,
     pub rgctxs_dictionary: HashMap<String, HashMap<u32, Vec<Il2CppRGCTXDefinition>>>,
+    pub is_pe: bool,
+    pub reverse_pinvoke_wrappers: Vec<u64>,
+    pub unresolved_virtual_call_pointers: Vec<u64>,
 }
 
 impl Il2Cpp {
@@ -76,6 +79,9 @@ impl Il2Cpp {
             type_dic: HashMap::new(),
             va_segments: Vec::new(),
             rgctxs_dictionary: HashMap::new(),
+            is_pe: false,
+            reverse_pinvoke_wrappers: Vec::new(),
+            unresolved_virtual_call_pointers: Vec::new(),
         }
     }
 
@@ -117,6 +123,9 @@ impl Il2Cpp {
                 offset: s.p_offset,
             }).collect(),
             rgctxs_dictionary: elf.rgctxs_dictionary.clone(),
+            is_pe: false,
+            reverse_pinvoke_wrappers: Vec::new(),
+            unresolved_virtual_call_pointers: Vec::new(),
         }
     }
 
