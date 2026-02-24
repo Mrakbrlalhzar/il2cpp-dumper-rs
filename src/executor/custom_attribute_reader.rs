@@ -124,6 +124,60 @@ impl CustomAttributeDataReader {
         }
     }
 
+    pub fn get_ctor_type_name(&mut self, metadata: &mut Metadata) -> Result<String> {
+        if self.remaining() == 0 {
+            return Err(crate::error::Error::Other("No data remaining".into()));
+        }
+
+        self.stream.set_position(self.ctor_buffer);
+        let ctor_index = self.stream.read_i32()? as usize;
+        self.ctor_buffer = self.stream.position();
+
+        self.stream.set_position(self.data_buffer);
+        let argument_count = self.stream.read_compressed_u32()?.min(MAX_ATTRIBUTE_ARGS);
+        let field_count = self.stream.read_compressed_u32()?.min(MAX_ATTRIBUTE_ARGS);
+        let property_count = self.stream.read_compressed_u32()?.min(MAX_ATTRIBUTE_ARGS);
+
+        for _ in 0..argument_count {
+            if self.remaining() == 0 { break; }
+            let _ = self.read_attribute_data_value();
+        }
+        for _ in 0..field_count {
+            if self.remaining() == 0 { break; }
+            let _ = self.read_attribute_data_value();
+            let method_def = metadata.method_defs.get(ctor_index).cloned();
+            let type_def = method_def.and_then(|md| metadata.type_defs.get(md.declaring_type as usize).cloned());
+            if let Some(ref td) = type_def {
+                let _ = self.read_named_argument_class_and_index(td, metadata);
+            }
+        }
+        for _ in 0..property_count {
+            if self.remaining() == 0 { break; }
+            let _ = self.read_attribute_data_value();
+            let method_def = metadata.method_defs.get(ctor_index).cloned();
+            let type_def = method_def.and_then(|md| metadata.type_defs.get(md.declaring_type as usize).cloned());
+            if let Some(ref td) = type_def {
+                let _ = self.read_named_argument_class_and_index(td, metadata);
+            }
+        }
+
+        self.data_buffer = self.stream.position();
+
+        let method_def = metadata.method_defs.get(ctor_index).cloned();
+        let type_def = method_def.and_then(|md| metadata.type_defs.get(md.declaring_type as usize).cloned());
+
+        let type_name = match type_def {
+            Some(td) => {
+                let ns = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
+                let name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+                if ns.is_empty() { name } else { format!("{ns}.{name}") }
+            }
+            None => format!("UnknownAttribute_{ctor_index}"),
+        };
+
+        Ok(type_name)
+    }
+
     fn read_attribute_data_value(&mut self) -> Result<String> {
         if self.remaining() == 0 {
             return Err(crate::error::Error::Other("No data remaining".into()));

@@ -17,21 +17,6 @@ pub fn escape_string(s: &str) -> String {
     result
 }
 
-pub fn sanitize_c_identifier(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            result.push(ch);
-        } else if matches!(ch, '.' | '/' | '<' | '>' | '[' | ']') {
-            result.push('_');
-        }
-    }
-    if result.starts_with(|c: char| c.is_ascii_digit()) {
-        result.insert(0, '_');
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,12 +28,5 @@ mod tests {
         assert_eq!(escape_string("line\nnew"), "line\\nnew");
         assert_eq!(escape_string("tab\there"), "tab\\there");
         assert_eq!(escape_string("back\\slash"), "back\\\\slash");
-    }
-
-    #[test]
-    fn test_sanitize() {
-        assert_eq!(sanitize_c_identifier("System.Collections.Generic"), "System_Collections_Generic");
-        assert_eq!(sanitize_c_identifier("List`1"), "List_1");
-        assert_eq!(sanitize_c_identifier("1BadName"), "_1BadName");
     }
 }

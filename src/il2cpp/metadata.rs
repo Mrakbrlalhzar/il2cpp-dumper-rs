@@ -370,6 +370,9 @@ impl Metadata {
     }
 
     pub fn get_string_literal_from_index(&mut self, index: usize) -> Result<String> {
+        if index >= self.string_literals.len() {
+            return Err(crate::error::Error::Other(format!("String literal index {} out of bounds (len {})", index, self.string_literals.len())));
+        }
         let sl = &self.string_literals[index];
         self.stream.set_position(self.header.string_literal_data_offset as u64 + sl.data_index as u64);
         let bytes = self.stream.read_bytes(sl.length as usize)?;

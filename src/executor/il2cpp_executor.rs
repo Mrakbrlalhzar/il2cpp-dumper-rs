@@ -29,7 +29,19 @@ impl std::fmt::Display for DefaultValue {
             DefaultValue::Bool(v) => write!(f, "{}", if *v { "true" } else { "false" }),
             DefaultValue::U8(v) => write!(f, "{v}"),
             DefaultValue::I8(v) => write!(f, "{v}"),
-            DefaultValue::Char(v) => write!(f, "'{v}'"),
+            DefaultValue::Char(v) => {
+                let escaped = match *v {
+                    '\\' => "'\\\\'" .to_string(),
+                    '\'' => "'\\''" .to_string(),
+                    '\n' => "'\\n'" .to_string(),
+                    '\r' => "'\\r'" .to_string(),
+                    '\t' => "'\\t'" .to_string(),
+                    '\0' => "'\\0'" .to_string(),
+                    c if c.is_control() => format!("'\\x{:04X}'", c as u32),
+                    c => format!("'{c}'"),
+                };
+                write!(f, "{escaped}")
+            }
             DefaultValue::U16(v) => write!(f, "{v}"),
             DefaultValue::I16(v) => write!(f, "{v}"),
             DefaultValue::U32(v) => write!(f, "{v}"),

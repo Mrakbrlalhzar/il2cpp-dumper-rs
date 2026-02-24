@@ -50,6 +50,17 @@ struct StructInfo {
 
 pub struct StructGenerator;
 
+/// Mutable context for header generation (il2cpp.h).
+/// Holds state that grows during generic class discovery.
+struct HeaderGenCtx {
+    /// Maps generic_class pointer → specialized struct name (e.g., "List_1_System_Int32")
+    generic_class_struct_name_dic: HashMap<u64, String>,
+    /// HashSet for dedup of struct names
+    struct_name_hash_set: HashSet<String>,
+    /// Newly discovered generic class pointers found during field parsing
+    newly_discovered: Vec<u64>,
+}
+
 impl StructGenerator {
     pub fn write_all(
         executor: &mut Il2CppExecutor,
@@ -210,7 +221,7 @@ impl StructGenerator {
         let mut type_signature_parts: Vec<Il2CppTypeEnum> = Vec::new();
 
         let method_return_type = il2cpp.types[method_def.return_type as usize].clone();
-        let return_type_c = Self::parse_type(&method_return_type, struct_name_dic, executor, metadata, il2cpp, generic_context);
+        let return_type_c = Self::parse_type(&method_return_type, struct_name_dic, executor, metadata, il2cpp, generic_context, None);
         let return_c = if method_return_type.byref == 1 {
             type_signature_parts.push(Il2CppTypeEnum::Ptr);
             format!("{}*", return_type_c)
@@ -226,8 +237,8 @@ impl StructGenerator {
         if !is_static {
             let byval_type = il2cpp.types[type_def.byval_type_index as usize].clone();
             let this_type = Self::parse_type(
-                &byval_type,
-                struct_name_dic, executor, metadata, il2cpp, None,
+                &il2cpp.types[type_def.byval_type_index as usize].clone(),
+                struct_name_dic, executor, metadata, il2cpp, generic_context, None,
             );
             let te = Il2CppTypeEnum::from_u8(byval_type.type_enum)
                 .unwrap_or(Il2CppTypeEnum::Object);
@@ -243,7 +254,7 @@ impl StructGenerator {
             let param_name = metadata.get_string_from_index(param_def.name_index)
                 .unwrap_or_else(|_| "param".to_string());
             let param_type = il2cpp.types[param_def.type_index as usize].clone();
-            let param_c_type = Self::parse_type(&param_type, struct_name_dic, executor, metadata, il2cpp, generic_context);
+            let param_c_type = Self::parse_type(&param_type, struct_name_dic, executor, metadata, il2cpp, generic_context, None);
             let (param_c, sig_type) = if param_type.byref == 1 {
                 (format!("{}*", param_c_type), Il2CppTypeEnum::Ptr)
             } else {
@@ -283,6 +294,7 @@ impl StructGenerator {
         metadata: &mut Metadata,
         il2cpp: &mut Il2Cpp,
         context: Option<&Il2CppGenericContext>,
+        mut hdr_ctx: Option<&mut HeaderGenCtx>,
     ) -> String {
         let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
         match te {
@@ -308,7 +320,7 @@ impl StructGenerator {
                 if let Some(td) = metadata.type_defs.get(klass_idx) {
                     if td.is_enum() {
                         if let Some(elem_type) = il2cpp.types.get(td.element_type_index as usize).cloned() {
-                            return Self::parse_type(&elem_type, struct_name_dic, executor, metadata, il2cpp, context);
+                            return Self::parse_type(&elem_type, struct_name_dic, executor, metadata, il2cpp, context, hdr_ctx);
                         }
                     }
                     if let Some(sn) = struct_name_dic.get(&klass_idx) {
@@ -339,17 +351,30 @@ impl StructGenerator {
                 if generic_class_ptr != 0 {
                     if let Ok(generic_class) = il2cpp.read_generic_class(generic_class_ptr) {
                         if let Some((type_def, td_idx)) = executor.get_generic_class_type_definition(&generic_class, metadata, il2cpp) {
-                            if type_def.is_value_type() {
-                                if type_def.is_enum() {
-                                    if let Some(elem) = il2cpp.types.get(type_def.element_type_index as usize).cloned() {
-                                        return Self::parse_type(&elem, struct_name_dic, executor, metadata, il2cpp, context);
+                            // Use specialized name from hdr_ctx if available, fallback to base name
+                            let type_struct_name = if let Some(ctx) = hdr_ctx.as_deref_mut() {
+                                if let Some(name) = ctx.generic_class_struct_name_dic.get(&generic_class_ptr) {
+                                    let name = name.clone();
+                                    // Add to newly_discovered if this is a new unique name
+                                    if ctx.struct_name_hash_set.insert(name.clone()) {
+                                        ctx.newly_discovered.push(generic_class_ptr);
                                     }
-                                }
-                                if let Some(sn) = struct_name_dic.get(&td_idx) {
-                                    return format!("{}_o", sn);
+                                    Some(name)
+                                } else {
+                                    struct_name_dic.get(&td_idx).cloned()
                                 }
                             } else {
-                                if let Some(sn) = struct_name_dic.get(&td_idx) {
+                                struct_name_dic.get(&td_idx).cloned()
+                            };
+                            if let Some(sn) = type_struct_name {
+                                if type_def.is_value_type() {
+                                    if type_def.is_enum() {
+                                        if let Some(elem) = il2cpp.types.get(type_def.element_type_index as usize).cloned() {
+                                            return Self::parse_type(&elem, struct_name_dic, executor, metadata, il2cpp, context, None);
+                                        }
+                                    }
+                                    return format!("{}_o", sn);
+                                } else {
                                     return format!("{}_o*", sn);
                                 }
                             }
@@ -363,7 +388,7 @@ impl StructGenerator {
                     let generic_param = executor.get_generic_parameter_from_type(il2cpp_type, metadata, il2cpp);
                     if let Some(gp) = generic_param {
                         if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
-                            return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None);
+                            return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None, None);
                         }
                     }
                 }
@@ -376,11 +401,11 @@ impl StructGenerator {
                         // C# issue #687: if method_inst == 0 && class_inst != 0, fall back to VAR
                         if ctx.method_inst == 0 && ctx.class_inst != 0 {
                             if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
-                                return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None);
+                                return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None, None);
                             }
                         } else {
                             if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.method_inst, gp.num as u32) {
-                                return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None);
+                                return Self::parse_type(&resolved, struct_name_dic, executor, metadata, il2cpp, None, None);
                             }
                         }
                     }
@@ -390,7 +415,7 @@ impl StructGenerator {
             Some(Il2CppTypeEnum::Ptr) => {
                 if il2cpp_type.datapoint != 0 {
                     if let Some(ori_type) = il2cpp.types.get(il2cpp_type.datapoint as usize).cloned() {
-                        let inner = Self::parse_type(&ori_type, struct_name_dic, executor, metadata, il2cpp, context);
+                        let inner = Self::parse_type(&ori_type, struct_name_dic, executor, metadata, il2cpp, context, hdr_ctx);
                         return format!("{}*", inner);
                     }
                 }
@@ -559,11 +584,12 @@ impl StructGenerator {
         type_def_image_names: &HashMap<usize, String>,
     ) {
         let pointer_size = if il2cpp.is_32bit { 4u64 } else { 8u64 };
-        let segments = il2cpp.va_segments.clone();
-        for seg in &segments {
-            let seg_end = std::cmp::min(seg.offset + seg.memsz, il2cpp.stream.len() as u64).saturating_sub(pointer_size);
-            let mut pos = seg.offset;
-            while pos < seg_end {
+        let data_sections = il2cpp.data_sections.clone();
+
+        for sec in &data_sections {
+            let sec_end = std::cmp::min(sec.offset_end, il2cpp.stream.len() as u64).saturating_sub(pointer_size);
+            let mut pos = sec.offset;
+            while pos < sec_end {
                 il2cpp.stream.set_position(pos);
                 let metadata_value = if il2cpp.is_32bit {
                     il2cpp.stream.read_u32().unwrap_or(0) as u64
@@ -577,11 +603,12 @@ impl StructGenerator {
                 let encoded_token = metadata_value as u32;
                 let usage = (encoded_token & 0xE0000000) >> 29;
                 if usage == 0 || usage > 6 { continue; }
-                let decoded_index = encoded_token & 0x1FFFFFFF;
+                let decoded_index = (encoded_token & 0x1FFFFFFE) >> 1;
                 let expected = ((usage << 29) | (decoded_index << 1)) + 1;
                 if metadata_value != expected as u64 { continue; }
 
-                let va = il2cpp.map_rtva(pos - pointer_size);
+                let addr = pos - pointer_size;
+                let va = il2cpp.map_rtva(addr);
                 if va == 0 { continue; }
                 let rva = il2cpp.get_rva(va);
 
@@ -591,7 +618,11 @@ impl StructGenerator {
                             let type_ref = il2cpp.types[decoded_index as usize].clone();
                             let type_name = executor.get_type_name(&type_ref, metadata, il2cpp, true, false);
                             let sig = if let Some(sn) = Self::get_struct_name_for_type(&type_ref, struct_name_dic, metadata) {
-                                format!("{}_c*", fix_name(&sn))
+                                if sn.ends_with("_array") {
+                                    "Il2CppClass*".to_string()
+                                } else {
+                                    format!("{}_c*", fix_name(&sn))
+                                }
                             } else {
                                 "Il2CppClass*".to_string()
                             };
@@ -634,6 +665,7 @@ impl StructGenerator {
                     4 => {
                         if (decoded_index as usize) < metadata.field_refs.len() {
                             let field_ref = metadata.field_refs[decoded_index as usize].clone();
+                            if (field_ref.type_index as usize) >= il2cpp.types.len() { continue; }
                             let il2cpp_type = il2cpp.types[field_ref.type_index as usize].clone();
                             let type_name = executor.get_type_name(&il2cpp_type, metadata, il2cpp, true, false);
                             let klass_idx = il2cpp_type.klass_index() as usize;
@@ -674,6 +706,10 @@ impl StructGenerator {
                         }
                     }
                     _ => {}
+                }
+
+                if il2cpp.stream.position() != saved_pos {
+                    il2cpp.stream.set_position(saved_pos);
                 }
             }
         }
@@ -772,7 +808,7 @@ impl StructGenerator {
         context: Option<&Il2CppGenericContext>,
     ) {
         let struct_name = Self::get_il2cpp_struct_name(element_type, struct_name_dic, il2cpp, context);
-        let element_c_type = Self::parse_type(element_type, struct_name_dic, executor, metadata, il2cpp, context);
+        let element_c_type = Self::parse_type(element_type, struct_name_dic, executor, metadata, il2cpp, context, None);
         writeln!(buf, "struct {}_array {{", struct_name).ok();
         writeln!(buf, "\tIl2CppObject obj;").ok();
         writeln!(buf, "\tIl2CppArrayBounds *bounds;").ok();
@@ -820,7 +856,7 @@ impl StructGenerator {
         let mut generic_class_struct_name_dic: HashMap<u64, String> = HashMap::new();
         let mut name_generic_class_dic: HashMap<String, Il2CppType> = HashMap::new();
         let mut generic_class_list: Vec<u64> = Vec::new();
-        let mut struct_name_hash_set: HashSet<String> = struct_name_dic.values().cloned().collect();
+        let struct_name_hash_set: HashSet<String> = struct_name_dic.values().cloned().collect();
         {
             let types_clone = il2cpp.types.clone();
             for il2cpp_type in &types_clone {
@@ -867,55 +903,82 @@ impl StructGenerator {
             };
 
             Self::add_parent(il2cpp, type_def, &struct_name_dic, metadata, &mut info);
-            Self::add_fields(executor, metadata, il2cpp, type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set);
+            Self::add_fields(executor, metadata, il2cpp, type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set, None, None);
             Self::add_vtable_methods(metadata, il2cpp, type_def, &mut info);
             Self::add_rgctx(executor, metadata, il2cpp, type_def, type_index, &type_def_image_names, &mut info);
 
             struct_info_list.push(info);
         }
 
-        // Process generic class instances (C# lines 380-384, 709-720)
-        let generic_dic_clone = generic_class_struct_name_dic.clone();
-        for (_, il2cpp_type) in il2cpp.types.clone().iter().enumerate() {
+        // Process generic class instances using fixpoint loop
+        // C# uses a self-expanding for loop: for(int i=0; i<genericClassList.Count; i++)
+        // where ParseType can add new entries during iteration.
+        let mut hdr_ctx = HeaderGenCtx {
+            generic_class_struct_name_dic: generic_class_struct_name_dic.clone(),
+            struct_name_hash_set: struct_name_hash_set,
+            newly_discovered: Vec::new(),
+        };
+
+        // Build initial list from all GENERICINST types in il2cpp.types
+        for il2cpp_type in il2cpp.types.clone().iter() {
             let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
             if te != Some(Il2CppTypeEnum::GenericInst) { continue; }
             let generic_class_ptr = il2cpp_type.generic_class();
             if generic_class_ptr == 0 { continue; }
-            let type_struct_name = match generic_dic_clone.get(&generic_class_ptr) {
-                Some(n) => n.clone(),
-                None => continue,
-            };
-            if !struct_name_hash_set.insert(type_struct_name.clone()) { continue; }
+            if !hdr_ctx.generic_class_struct_name_dic.contains_key(&generic_class_ptr) { continue; }
+            let type_struct_name = hdr_ctx.generic_class_struct_name_dic[&generic_class_ptr].clone();
+            if !hdr_ctx.struct_name_hash_set.insert(type_struct_name) { continue; }
             generic_class_list.push(generic_class_ptr);
         }
-        for pointer in &generic_class_list {
-            let generic_class = match il2cpp.read_generic_class(*pointer) {
-                Ok(gc) => gc,
-                Err(_) => continue,
-            };
-            let type_def_result = executor.get_generic_class_type_definition(&generic_class, metadata, il2cpp);
-            let (type_def, _td_idx) = match type_def_result {
-                Some(td) => td,
-                None => continue,
-            };
-            let type_struct_name = match generic_dic_clone.get(pointer) {
-                Some(n) => n.clone(),
-                None => continue,
-            };
-            let mut info = StructInfo {
-                type_name: type_struct_name,
-                is_value_type: type_def.is_value_type(),
-                parent: None,
-                fields: Vec::new(),
-                static_fields: Vec::new(),
-                vtable_methods: Vec::new(),
-                rgctxs: Vec::new(),
-            };
-            Self::add_parent(il2cpp, &type_def, &struct_name_dic, metadata, &mut info);
-            Self::add_fields(executor, metadata, il2cpp, &type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set);
-            Self::add_vtable_methods(metadata, il2cpp, &type_def, &mut info);
-            struct_info_list.push(info);
+
+        // Fixpoint loop: process generic classes, discovering new ones as field types are parsed
+        let mut processed = 0;
+        loop {
+            let current_len = generic_class_list.len();
+            if processed >= current_len { break; }
+
+            for idx in processed..current_len {
+                let pointer = generic_class_list[idx];
+                let generic_class = match il2cpp.read_generic_class(pointer) {
+                    Ok(gc) => gc,
+                    Err(_) => continue,
+                };
+                let type_def_result = executor.get_generic_class_type_definition(&generic_class, metadata, il2cpp);
+                let (type_def, _td_idx) = match type_def_result {
+                    Some(td) => td,
+                    None => continue,
+                };
+                let type_struct_name = match hdr_ctx.generic_class_struct_name_dic.get(&pointer) {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                let mut info = StructInfo {
+                    type_name: type_struct_name,
+                    is_value_type: type_def.is_value_type(),
+                    parent: None,
+                    fields: Vec::new(),
+                    static_fields: Vec::new(),
+                    vtable_methods: Vec::new(),
+                    rgctxs: Vec::new(),
+                };
+                let context = Il2CppGenericContext {
+                    class_inst: generic_class.context.class_inst,
+                    method_inst: generic_class.context.method_inst,
+                };
+                Self::add_parent(il2cpp, &type_def, &struct_name_dic, metadata, &mut info);
+                Self::add_fields(executor, metadata, il2cpp, &type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set, Some(&context), Some(&mut hdr_ctx));
+                Self::add_vtable_methods(metadata, il2cpp, &type_def, &mut info);
+                struct_info_list.push(info);
+            }
+
+            processed = current_len;
+
+            // Drain newly discovered generic classes into the main list
+            let new_ptrs: Vec<u64> = hdr_ctx.newly_discovered.drain(..).collect();
+            generic_class_list.extend(new_ptrs);
         }
+
+
 
         let struct_info_by_name: HashMap<String, usize> = struct_info_list.iter().enumerate()
             .map(|(i, info)| (format!("{}_o", info.type_name), i))
@@ -947,8 +1010,10 @@ impl StructGenerator {
                     if let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index).cloned() {
                         for spec_idx in &spec_indices {
                             if *spec_idx >= il2cpp.method_specs.len() { continue; }
-                            let method_spec = il2cpp.method_specs[*spec_idx].clone();
-                            if method_spec.method_index_index < 0 { continue; }
+                            let _method_spec = il2cpp.method_specs[*spec_idx].clone();
+                            // Note: do NOT filter on method_index_index < 0 here.
+                            // C# generates MethodInfo for ALL method specs with genericMethodPointer > 0,
+                            // including those with only class-level generics (method_index_index == -1).
 
                             let generic_method_pointer = il2cpp.method_spec_generic_method_pointers.get(spec_idx).copied().unwrap_or(0);
                             if generic_method_pointer == 0 { continue; }
@@ -1009,6 +1074,8 @@ impl StructGenerator {
         info: &mut StructInfo,
         array_class_header: &mut String,
         array_class_set: &mut HashSet<String>,
+        context: Option<&Il2CppGenericContext>,
+        mut hdr_ctx: Option<&mut HeaderGenCtx>,
     ) {
         if type_def.field_count == 0 { return; }
         let field_end = type_def.field_start as usize + type_def.field_count as usize;
@@ -1024,16 +1091,16 @@ impl StructGenerator {
             if te == Some(Il2CppTypeEnum::SzArray) || te == Some(Il2CppTypeEnum::Array) {
                 if field_type.datapoint != 0 {
                     if let Some(element_type) = il2cpp.types.get(field_type.datapoint as usize).cloned() {
-                        let elem_struct_name = Self::get_il2cpp_struct_name(&element_type, struct_name_dic, il2cpp, None);
+                        let elem_struct_name = Self::get_il2cpp_struct_name(&element_type, struct_name_dic, il2cpp, context);
                         let array_struct_name = format!("{}_array", elem_struct_name);
                         if array_class_set.insert(array_struct_name) {
-                            Self::parse_array_class_struct(array_class_header, &element_type, struct_name_dic, executor, metadata, il2cpp, None);
+                            Self::parse_array_class_struct(array_class_header, &element_type, struct_name_dic, executor, metadata, il2cpp, context);
                         }
                     }
                 }
             }
 
-            let field_type_name = Self::parse_type(&field_type, struct_name_dic, executor, metadata, il2cpp, None);
+            let field_type_name = Self::parse_type(&field_type, struct_name_dic, executor, metadata, il2cpp, context, hdr_ctx.as_deref_mut());
             let mut field_name = fix_name(&metadata.get_string_from_index(field_def.name_index).unwrap_or_else(|_| "field".to_string()));
             if !field_name_cache.insert(field_name.clone()) {
                 field_name = format!("_{}_{}", i - type_def.field_start as usize, field_name);
@@ -1139,7 +1206,12 @@ impl StructGenerator {
 
             let encoded = metadata.vtable_methods[vtable_index];
             let usage = (encoded & 0xE0000000) >> 29;
-            let index = encoded & 0x1FFFFFFF;
+            // v27+ uses different index encoding: (encoded & 0x1FFFFFFEU) >> 1
+            let index = if metadata.version >= 27.0 {
+                (encoded & 0x1FFFFFFE) >> 1
+            } else {
+                encoded & 0x1FFFFFFF
+            };
 
             let method_def = if usage == 6 {
                 if (index as usize) < il2cpp.method_specs.len() {

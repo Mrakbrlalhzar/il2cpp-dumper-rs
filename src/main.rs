@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write, BufRead};
 use std::process;
+use std::time::Instant;
 
 use clap::Parser;
 
@@ -358,6 +359,7 @@ fn detect_format(data: &[u8]) -> &'static str {
 }
 
 fn run() -> Result<()> {
+    let start_time = Instant::now();
     let cli = Cli::parse();
 
     let config = if let Some(ref cp) = cli.config {
@@ -371,7 +373,13 @@ fn run() -> Result<()> {
         Config::default()
     };
 
-    fs::create_dir_all(&cli.output_dir).ok();
+    let base_dir = std::path::Path::new(&cli.output_dir);
+    let mut dump_num = 0u32;
+    while base_dir.join(format!("Dump{dump_num}")).exists() {
+        dump_num += 1;
+    }
+    let output_dir = base_dir.join(format!("Dump{dump_num}")).to_string_lossy().to_string();
+    fs::create_dir_all(&output_dir).ok();
 
     println!("Initializing metadata...");
     let metadata_bytes = fs::read(&cli.metadata)?;
@@ -404,30 +412,26 @@ fn run() -> Result<()> {
     println!("Dumping...");
     let mut executor = Il2CppExecutor::new(&metadata, &mut il2cpp)?;
 
-    Il2CppDecompiler::decompile(&mut executor, &mut metadata, &mut il2cpp, &config, &cli.output_dir)?;
+    Il2CppDecompiler::decompile(&mut executor, &mut metadata, &mut il2cpp, &config, &output_dir)?;
     println!("dump.cs generated");
 
     if config.generate_struct {
         println!("Generating struct...");
-        StructGenerator::write_all(&mut executor, &mut metadata, &mut il2cpp, &cli.output_dir)?;
+        StructGenerator::write_all(&mut executor, &mut metadata, &mut il2cpp, &output_dir)?;
+        il2cpp_dumper::output::embedded_scripts::write_scripts(std::path::Path::new(&output_dir))?;
         println!("script.json, il2cpp.h, stringliteral.json generated");
     }
 
     if config.generate_dummy_dll {
         println!("Generating dummy dll...");
         il2cpp_dumper::output::dummy_assembly_generator::generate_dummy_dlls(
-            &mut executor, &mut metadata, &mut il2cpp, &config, &cli.output_dir,
+            &mut executor, &mut metadata, &mut il2cpp, &config, &output_dir,
         )?;
         println!("Dummy dll files generated");
     }
 
-    println!("Done!");
-
-    if config.require_any_key {
-        print!("Press Enter to exit...");
-        io::stdout().flush().ok();
-        let _ = io::stdin().read_line(&mut String::new());
-    }
+    let elapsed = start_time.elapsed();
+    println!("Done! ({:.2}s)", elapsed.as_secs_f64());
 
     Ok(())
 }

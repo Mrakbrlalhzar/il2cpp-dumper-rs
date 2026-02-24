@@ -5,7 +5,7 @@ use std::path::Path;
 
 use dotnetdll::resolved::body;
 use dotnetdll::resolved::il::Instruction;
-use dotnetdll::resolved::members::{self, Field, Method, Property, Event};
+use dotnetdll::resolved::members::{self, Field, Method, Property, Event, ParameterMetadata};
 use dotnetdll::resolved::module::Module;
 use dotnetdll::resolved::signature::{
     MethodSignature, Parameter, ReturnType,
@@ -17,7 +17,8 @@ use dotnetdll::resolved::types::{
 };
 use dotnetdll::resolved::assembly::ExternalAssemblyReference;
 use dotnetdll::resolved::generic;
-use dotnetdll::resolution::Resolution;
+use dotnetdll::resolved::attribute::{Attribute, CustomAttributeData, NamedArg, FixedArg};
+use dotnetdll::resolution::{Resolution, MethodRefIndex};
 
 use crate::il2cpp::metadata::Metadata;
 use crate::il2cpp::base::Il2Cpp;
@@ -26,6 +27,66 @@ use crate::il2cpp::structures::*;
 use crate::executor::Il2CppExecutor;
 use crate::config::Config;
 use crate::error::Result;
+
+#[allow(dead_code)]
+struct AttrCtors {
+    address_ctor: MethodRefIndex,
+    field_offset_ctor: MethodRefIndex,
+    token_ctor: MethodRefIndex,
+    attribute_ctor: MethodRefIndex,
+    metadata_offset_ctor: MethodRefIndex,
+}
+
+fn make_named_string_attr<'a>(ctor: MethodRefIndex, fields: Vec<(&str, String)>) -> Attribute<'a> {
+    let named_args = fields.into_iter().map(|(name, value)| {
+        NamedArg::Field(
+            Cow::Owned(name.to_string()),
+            FixedArg::String(Some(Cow::Owned(value))),
+        )
+    }).collect();
+    Attribute::new(
+        members::UserMethod::Reference(ctor),
+        CustomAttributeData {
+            constructor_args: vec![],
+            named_args,
+        },
+    )
+}
+
+fn push_attr_ctor(resolution: &mut Resolution<'_>, asm_ref: dotnetdll::resolution::AssemblyRefIndex, name: String) -> MethodRefIndex {
+    let type_ref = resolution.push_type_reference(
+        ExternalTypeReference::new(
+            None,
+            Cow::Owned(name),
+            ResolutionScope::Assembly(asm_ref),
+        ),
+    );
+    let parent_type = MethodType::Base(Box::new(BaseType::Type {
+        value_kind: Some(ValueKind::Class),
+        source: TypeSource::User(UserType::Reference(type_ref)),
+    }));
+    resolution.push_method_reference(
+        members::ExternalMethodReference::new(
+            members::MethodReferenceParent::Type(parent_type),
+            ".ctor",
+            MethodSignature::new(true, ReturnType::VOID, vec![]),
+        ),
+    )
+}
+
+fn setup_il2cpp_dummy_dll_refs(resolution: &mut Resolution<'_>) -> AttrCtors {
+    let dummy_asm_ref = resolution.push_assembly_reference(
+        ExternalAssemblyReference::new("Il2CppDummyDll"),
+    );
+
+    AttrCtors {
+        address_ctor: push_attr_ctor(resolution, dummy_asm_ref, "AddressAttribute".to_string()),
+        field_offset_ctor: push_attr_ctor(resolution, dummy_asm_ref, "FieldOffsetAttribute".to_string()),
+        token_ctor: push_attr_ctor(resolution, dummy_asm_ref, "TokenAttribute".to_string()),
+        attribute_ctor: push_attr_ctor(resolution, dummy_asm_ref, "AttributeAttribute".to_string()),
+        metadata_offset_ctor: push_attr_ctor(resolution, dummy_asm_ref, "MetadataOffsetAttribute".to_string()),
+    }
+}
 
 #[allow(dead_code)]
 struct DummyDllContext {
@@ -177,6 +238,8 @@ pub fn generate_dummy_dlls(
             }
         }
 
+        let attr_ctors = setup_il2cpp_dummy_dll_refs(&mut resolution);
+
         let ctx = DummyDllContext {
             type_map: type_map.clone(),
             mscorlib_ref,
@@ -301,6 +364,12 @@ pub fn generate_dummy_dlls(
                 if let Some(&dotnet_idx) = type_map.get(&index) {
                     let skip_body = *multicast_delegate_set.get(&index).unwrap_or(&false);
 
+                    let token_attr = make_named_string_attr(
+                        attr_ctors.token_ctor,
+                        vec![("Token", format!("0x{:X}", type_def.token))],
+                    );
+                    resolution.type_definitions[dotnet_idx].attributes.push(token_attr);
+
                     let field_end = type_def.field_start + type_def.field_count as i32;
                     for fi in type_def.field_start..field_end {
                         if let Some(field_def) = field_defs_all.get(fi as usize) {
@@ -335,6 +404,26 @@ pub fn generate_dummy_dlls(
                                 }
                             }
 
+                            field.attributes.push(make_named_string_attr(
+                                attr_ctors.token_ctor,
+                                vec![("Token", format!("0x{:X}", field_def.token))],
+                            ));
+
+                            if !is_literal {
+                                let ft_enum = ft.map(|t| Il2CppTypeEnum::from_u8(t.type_enum));
+                                let is_vt = matches!(ft_enum, Some(Some(Il2CppTypeEnum::ValueType)));
+                                let field_offset = il2cpp.get_field_offset_from_index(
+                                    index, (fi - type_def.field_start) as usize, fi as usize,
+                                    is_vt, is_static,
+                                );
+                                if field_offset >= 0 {
+                                    field.attributes.push(make_named_string_attr(
+                                        attr_ctors.field_offset_ctor,
+                                        vec![("Offset", format!("0x{:X}", field_offset))],
+                                    ));
+                                }
+                            }
+
                             resolution.type_definitions[dotnet_idx].fields.push(field);
                         }
                     }
@@ -351,6 +440,7 @@ pub fn generate_dummy_dlls(
                                 .unwrap_or(ReturnType::VOID);
 
                             let mut params = Vec::new();
+                            let mut param_metadata = Vec::new();
                             for j in 0..method_def.parameter_count as usize {
                                 let pidx = method_def.parameter_start as usize + j;
                                 if let Some(pdef) = parameter_defs_all.get(pidx) {
@@ -365,6 +455,28 @@ pub fn generate_dummy_dlls(
                                     } else {
                                         params.push(Parameter::value(ptype));
                                     }
+
+                                    let pname = metadata.get_string_from_index(pdef.name_index)
+                                        .unwrap_or_else(|_| format!("param{j}"));
+                                    let mut pmeta = ParameterMetadata::name(Cow::Owned(pname));
+                                    pmeta.is_in = (pt.map(|t| t.attrs).unwrap_or(0) & 0x0001) != 0;
+                                    pmeta.is_out = (pt.map(|t| t.attrs).unwrap_or(0) & 0x0002) != 0;
+                                    pmeta.optional = (pt.map(|t| t.attrs).unwrap_or(0) & 0x0010) != 0;
+
+                                    if let Some(pdv) = metadata.get_parameter_default_value(pidx as i32) {
+                                        if pdv.data_index != -1 {
+                                            match executor.try_get_default_value(
+                                                pdv.type_index, pdv.data_index, metadata, il2cpp,
+                                            ) {
+                                                Ok(dv) => {
+                                                    pmeta.default = Some(default_value_to_constant(&dv));
+                                                }
+                                                Err(_) => {}
+                                            }
+                                        }
+                                    }
+
+                                    param_metadata.push(Some(pmeta));
                                 }
                             }
 
@@ -441,9 +553,35 @@ pub fn generate_dummy_dlls(
                             method.hide_by_sig = is_hide_by_sig;
                             method.special_name = is_special_name;
                             method.runtime_special_name = is_rt_special_name;
+                            method.parameter_metadata = param_metadata;
 
                             if has_new_slot {
                                 method.vtable_layout = members::VtableLayout::NewSlot;
+                            }
+
+                            method.attributes.push(make_named_string_attr(
+                                attr_ctors.token_ctor,
+                                vec![("Token", format!("0x{:X}", method_def.token))],
+                            ));
+
+                            if !is_abstract {
+                                let method_pointer = il2cpp.get_method_pointer(&image_name, &method_def);
+                                if method_pointer > 0 {
+                                    let rva = il2cpp.get_rva(method_pointer);
+                                    let offset = il2cpp.map_vatr(method_pointer).unwrap_or(0);
+                                    let mut addr_fields = vec![
+                                        ("RVA", format!("0x{:X}", rva)),
+                                        ("Offset", format!("0x{:X}", offset)),
+                                        ("VA", format!("0x{:X}", method_pointer)),
+                                    ];
+                                    if method_def.slot != 0xFFFF {
+                                        addr_fields.push(("Slot", method_def.slot.to_string()));
+                                    }
+                                    method.attributes.push(make_named_string_attr(
+                                        attr_ctors.address_ctor,
+                                        addr_fields,
+                                    ));
+                                }
                             }
 
                             if method_def.generic_container_index >= 0 {
@@ -614,6 +752,51 @@ pub fn generate_dummy_dlls(
             }
         }
 
+        if metadata.version > 20.0 {
+            for index in type_start..type_end {
+                if let Some(type_def) = type_defs_all.get(index).cloned() {
+                    if let Some(&dotnet_idx) = type_map.get(&index) {
+                        add_attribute_attributes(
+                            metadata, il2cpp, executor, img_idx,
+                            type_def.custom_attribute_index, type_def.token,
+                            &type_defs_all, &attr_ctors,
+                            &mut resolution.type_definitions[dotnet_idx].attributes,
+                        );
+
+                        let field_end = type_def.field_start + type_def.field_count as i32;
+                        for fi in type_def.field_start..field_end {
+                            if let Some(field_def) = field_defs_all.get(fi as usize) {
+                                let fi_in_type = (fi - type_def.field_start) as usize;
+                                if fi_in_type < resolution.type_definitions[dotnet_idx].fields.len() {
+                                    add_attribute_attributes(
+                                        metadata, il2cpp, executor, img_idx,
+                                        field_def.custom_attribute_index, field_def.token,
+                                        &type_defs_all, &attr_ctors,
+                                        &mut resolution.type_definitions[dotnet_idx].fields[fi_in_type].attributes,
+                                    );
+                                }
+                            }
+                        }
+
+                        let method_end = type_def.method_start + type_def.method_count as i32;
+                        for mi in type_def.method_start..method_end {
+                            if let Some(method_def) = method_defs_all.get(mi as usize) {
+                                let mi_in_type = (mi - type_def.method_start) as usize;
+                                if mi_in_type < resolution.type_definitions[dotnet_idx].methods.len() {
+                                    add_attribute_attributes(
+                                        metadata, il2cpp, executor, img_idx,
+                                        method_def.custom_attribute_index, method_def.token,
+                                        &type_defs_all, &attr_ctors,
+                                        &mut resolution.type_definitions[dotnet_idx].methods[mi_in_type].attributes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let dll_name = if image_name.ends_with(".dll") {
             image_name.clone()
         } else {
@@ -633,6 +816,8 @@ pub fn generate_dummy_dlls(
         }
     }
 
+    generate_il2cpp_dummy_dll(&dummy_dir)?;
+
     Ok(())
 }
 
@@ -648,6 +833,193 @@ fn make_stub_event_method<'a>(name: &str, etype: &MemberType, skip_body: bool) -
         Cow::Owned(name.to_string()),
         if !skip_body { Some(body::Method::new(vec![Instruction::Return])) } else { None },
     )
+}
+
+fn add_attribute_attributes<'a>(
+    metadata: &mut Metadata,
+    il2cpp: &Il2Cpp,
+    executor: &Il2CppExecutor,
+    image_index: usize,
+    custom_attribute_index: i32,
+    token: u32,
+    type_defs_all: &[Il2CppTypeDefinition],
+    attr_ctors: &AttrCtors,
+    target_attrs: &mut Vec<Attribute<'a>>,
+) {
+    let attr_idx = match metadata.get_custom_attribute_index(image_index, custom_attribute_index, token) {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    if metadata.version < 29.0 {
+        if attr_idx >= metadata.attribute_type_ranges.len() {
+            return;
+        }
+        let range = &metadata.attribute_type_ranges[attr_idx];
+        let range_start = range.start as usize;
+        let range_count = range.count as usize;
+        for i in 0..range_count {
+            let type_idx = match metadata.attribute_types.get(range_start + i) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if type_idx < 0 || (type_idx as usize) >= il2cpp.types.len() {
+                continue;
+            }
+            let attr_type = &il2cpp.types[type_idx as usize];
+            let type_name = get_type_name_from_il2cpp_type(attr_type, metadata, type_defs_all);
+
+            let method_pointer = if attr_idx < executor.custom_attribute_generators.len() {
+                executor.custom_attribute_generators[attr_idx]
+            } else {
+                0
+            };
+
+            let mut fields = vec![("Name", type_name)];
+            if method_pointer > 0 {
+                let rva = il2cpp.get_rva(method_pointer);
+                let offset = il2cpp.map_vatr(method_pointer).unwrap_or(0);
+                fields.push(("RVA", format!("0x{:X}", rva)));
+                fields.push(("Offset", format!("0x{:X}", offset)));
+            }
+
+            target_attrs.push(make_named_string_attr(attr_ctors.attribute_ctor, fields));
+        }
+    } else {
+        let start_range = match metadata.attribute_data_ranges.get(attr_idx) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let end_range = match metadata.attribute_data_ranges.get(attr_idx + 1) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        if end_range.start_offset <= start_range.start_offset {
+            return;
+        }
+
+        let data_offset = metadata.header.attribute_data_offset as u64 + start_range.start_offset as u64;
+        let data_size = (end_range.start_offset - start_range.start_offset) as usize;
+        if data_size == 0 || data_size > 1024 * 1024 {
+            return;
+        }
+
+        metadata.stream.set_position(data_offset);
+        let data = match metadata.stream.read_bytes(data_size) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut reader = match crate::executor::custom_attribute_reader::CustomAttributeDataReader::new(data) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        if reader.count == 0 {
+            return;
+        }
+
+        for _ in 0..reader.count {
+            match reader.get_ctor_type_name(metadata) {
+                Ok(type_name) => {
+                    let fields = vec![("Name", type_name)];
+                    target_attrs.push(make_named_string_attr(attr_ctors.attribute_ctor, fields));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+fn get_type_name_from_il2cpp_type(
+    il2cpp_type: &Il2CppType,
+    metadata: &mut Metadata,
+    type_defs: &[Il2CppTypeDefinition],
+) -> String {
+    let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
+    match te {
+        Some(Il2CppTypeEnum::Class) | Some(Il2CppTypeEnum::ValueType) => {
+            let td_idx = il2cpp_type.datapoint as usize;
+            if let Some(td) = type_defs.get(td_idx) {
+                let ns = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
+                let name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+                if ns.is_empty() { name } else { format!("{ns}.{name}") }
+            } else {
+                format!("Type_{td_idx}")
+            }
+        }
+        _ => format!("il2cpp_type_{}", il2cpp_type.type_enum),
+    }
+}
+
+fn generate_il2cpp_dummy_dll(dummy_dir: &Path) -> Result<()> {
+    let mut resolution = Resolution::new(Module::new("Il2CppDummyDll.dll"));
+    resolution.assembly = Some(dotnetdll::resolved::assembly::Assembly::new("Il2CppDummyDll"));
+    resolution.type_definitions.clear();
+
+    let mscorlib_ref = resolution.push_assembly_reference(
+        ExternalAssemblyReference::new("mscorlib"),
+    );
+
+    let attribute_base_ref = resolution.push_type_reference(
+        ExternalTypeReference::new(
+            Some(Cow::Borrowed("System")),
+            "Attribute",
+            ResolutionScope::Assembly(mscorlib_ref),
+        ),
+    );
+    let attribute_base = TypeSource::User(UserType::Reference(attribute_base_ref));
+
+    let string_type = MemberType::Base(Box::new(BaseType::String));
+
+    let attr_types = &[
+        ("AddressAttribute", vec!["RVA", "Offset", "VA", "Slot"]),
+        ("FieldOffsetAttribute", vec!["Offset"]),
+        ("TokenAttribute", vec!["Token"]),
+        ("AttributeAttribute", vec!["Name", "RVA", "Offset"]),
+        ("MetadataOffsetAttribute", vec!["Offset"]),
+    ];
+
+    for (name, fields) in attr_types {
+        let mut td = DotNetTypeDef::new(None, Cow::Owned(name.to_string()));
+        td.extends = Some(attribute_base.clone());
+        td.flags.accessibility = TypeAccessibility::Public;
+        td.flags.before_field_init = true;
+
+        for field_name in fields {
+            let field = Field::new(
+                false,
+                dotnetdll::resolved::Accessibility::Public,
+                Cow::Owned(field_name.to_string()),
+                string_type.clone(),
+            );
+            td.fields.push(field);
+        }
+
+        let ctor = Method::constructor(
+            dotnetdll::resolved::Accessibility::Public,
+            vec![],
+            Some(body::Method::new(vec![Instruction::Return])),
+        );
+        td.methods.push(ctor);
+
+        resolution.type_definitions.push(td);
+    }
+
+    let dll_path = dummy_dir.join("Il2CppDummyDll.dll");
+    match resolution.write(Default::default()) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(&dll_path, &bytes) {
+                eprintln!("WARNING: Failed to write Il2CppDummyDll.dll: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("WARNING: Failed to serialize Il2CppDummyDll.dll: {e:?}");
+        }
+    }
+
+    Ok(())
 }
 
 fn default_value_to_constant(dv: &crate::executor::il2cpp_executor::DefaultValue) -> members::Constant {

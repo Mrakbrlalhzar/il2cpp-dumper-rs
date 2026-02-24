@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use crate::io::BinaryStream;
 use crate::error::{Result, Error};
+use crate::search::SearchSection;
 use super::structures::*;
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ pub struct Il2Cpp {
     field_offsets_are_pointers: bool,
     type_dic: HashMap<u64, usize>,
     pub va_segments: Vec<VaSegment>,
+    pub data_sections: Vec<SearchSection>,
     pub rgctxs_dictionary: HashMap<String, HashMap<u32, Vec<Il2CppRGCTXDefinition>>>,
     pub is_pe: bool,
     pub reverse_pinvoke_wrappers: Vec<u64>,
@@ -78,6 +80,7 @@ impl Il2Cpp {
             field_offsets_are_pointers: false,
             type_dic: HashMap::new(),
             va_segments: Vec::new(),
+            data_sections: Vec::new(),
             rgctxs_dictionary: HashMap::new(),
             is_pe: false,
             reverse_pinvoke_wrappers: Vec::new(),
@@ -122,6 +125,14 @@ impl Il2Cpp {
                 memsz: s.p_memsz,
                 offset: s.p_offset,
             }).collect(),
+            data_sections: elf.segments.iter().filter(|s| {
+                s.p_memsz != 0 && matches!(s.p_flags, 2 | 4 | 6)
+            }).map(|s| SearchSection::new(
+                s.p_offset,
+                s.p_offset + s.p_filesz,
+                s.p_vaddr,
+                s.p_vaddr + s.p_memsz,
+            )).collect(),
             rgctxs_dictionary: elf.rgctxs_dictionary.clone(),
             is_pe: false,
             reverse_pinvoke_wrappers: Vec::new(),
