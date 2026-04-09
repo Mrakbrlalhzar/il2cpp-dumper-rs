@@ -339,6 +339,21 @@ impl BinaryStream {
         }
     }
 
+    pub fn read_variable_index(&mut self, width: u8) -> Result<i32> {
+        match width {
+            1 => {
+                let v = self.read_u8()?;
+                Ok(if v == u8::MAX { -1 } else { v as i32 })
+            }
+            2 => {
+                let v = self.read_u16()?;
+                Ok(if v == u16::MAX { -1 } else { v as i32 })
+            }
+            4 => self.read_i32(),
+            _ => Err(crate::error::Error::Other(format!("Invalid variable index width: {width}"))),
+        }
+    }
+
     pub fn slice(&self, start: u64, len: usize) -> Result<&[u8]> {
         let s = start as usize;
         let data = self.cursor.get_ref();

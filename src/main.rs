@@ -48,6 +48,38 @@ fn read_magic_u16(data: &[u8]) -> u16 {
     u16::from_le_bytes([data[0], data[1]])
 }
 
+fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
+    if data.len() < 8 {
+        return None;
+    }
+
+    let magic = MAGIC_METADATA.to_le_bytes();
+
+    let k1 = magic[0] ^ data[0];
+    if k1 != 0 && (1..4).all(|i| (magic[i] ^ data[i]) == k1) {
+        for b in data.iter_mut() { *b ^= k1; }
+        return Some(format!("Single-byte XOR (key: 0x{k1:02X})"));
+    }
+
+    let key4: [u8; 4] = std::array::from_fn(|i| magic[i] ^ data[i]);
+    if key4 != [0u8; 4] && key4.iter().any(|&b| b != 0) {
+        let _consistent = data[..8].iter().enumerate().all(|(i, &b)| {
+            (key4[i % 4] ^ b) == if i < 4 { magic[i] } else { 0 ^ b ^ key4[i % 4] ^ b }
+        });
+        let check: [u8; 4] = std::array::from_fn(|i| data[i] ^ key4[i]);
+        if check == magic {
+            let all_same = key4.windows(2).all(|w| w[0] == w[1]);
+            if !all_same {
+                for (i, b) in data.iter_mut().enumerate() { *b ^= key4[i % 4]; }
+                return Some(format!("4-byte XOR (key: {:02X}{:02X}{:02X}{:02X})",
+                    key4[0], key4[1], key4[2], key4[3]));
+            }
+        }
+    }
+
+    None
+}
+
 fn detect_unity_version(data: &[u8]) -> Option<String> {
     let mut best: Option<String> = None;
     let mut i = 0;
@@ -484,23 +516,30 @@ fn run() -> Result<()> {
     let output_dir = base_dir.join(format!("Dump{dump_num}")).to_string_lossy().to_string();
     fs::create_dir_all(&output_dir).ok();
 
-    println!("Initializing metadata...");
-    let metadata_bytes = fs::read(&cli.metadata)?;
-    let metadata_magic = read_magic_u32(&metadata_bytes);
-    if metadata_magic != MAGIC_METADATA {
-        return Err(il2cpp_dumper::error::Error::Other(
-            format!("Invalid metadata file (magic: 0x{metadata_magic:08X})")
-        ));
-    }
-    let mut metadata = Metadata::new(metadata_bytes)?;
-    println!("Metadata Version: {}", metadata.version);
-
-    println!("Initializing IL2CPP binary...");
+    println!("Initializing IL2CPP binary...\r");
     let il2cpp_bytes = fs::read(&cli.il2cpp_binary)?;
 
-    if let Some(unity_ver) = detect_unity_version(&il2cpp_bytes) {
-        println!("Unity Version: {unity_ver}");
+    let unity_version_str = detect_unity_version(&il2cpp_bytes);
+    if let Some(ref uv) = unity_version_str {
+        println!("Unity Version: {uv}");
     }
+
+    println!("Initializing metadata...\r");
+    let mut metadata_bytes = fs::read(&cli.metadata)?;
+    let metadata_magic = read_magic_u32(&metadata_bytes);
+    if metadata_magic != MAGIC_METADATA {
+        match try_decrypt_metadata(&mut metadata_bytes) {
+            Some(scheme) => println!("Encrypted metadata detected ({scheme}), decrypting..."),
+            None => return Err(il2cpp_dumper::error::Error::Other(
+                format!("Invalid metadata file (magic: 0x{metadata_magic:08X}). Encryption not recognized.")
+            )),
+        }
+    }
+    let mut metadata = Metadata::new_with_unity_version(
+        metadata_bytes,
+        unity_version_str.as_deref(),
+    )?;
+    println!("Metadata Version: {}", metadata.version);
 
     let format = detect_format(&il2cpp_bytes);
 

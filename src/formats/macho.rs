@@ -619,6 +619,13 @@ impl MachO {
     }
 
     pub fn check_dump(&self) -> bool {
+        // Normal/decrypted IPA: __TEXT fileoff=0, vmaddr=0x100000000 (structure intact)
+        // Raw memory dump:      __TEXT fileoff=vmaddr (file IS the memory image)
+        for seg in &self.segments {
+            if seg.segname == "__TEXT" {
+                return seg.fileoff > 0 && seg.fileoff == seg.vmaddr;
+            }
+        }
         false
     }
 

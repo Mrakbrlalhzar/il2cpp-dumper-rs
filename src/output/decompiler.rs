@@ -311,7 +311,9 @@ impl Il2CppDecompiler {
 
             if config.dump_method_offset {
                 let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
-                if !is_abstract && method_pointer > 0 {
+                if is_abstract {
+                    write!(buf, "\t// ").ok();
+                } else if method_pointer > 0 {
                     let rva = il2cpp.get_rva(method_pointer);
                     let offset = il2cpp.map_vatr(method_pointer).unwrap_or(rva);
                     write!(buf, "\t// RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{method_pointer:X}").ok();
@@ -416,7 +418,7 @@ impl Il2CppDecompiler {
                         let offset = il2cpp.map_vatr(*ptr).unwrap_or(rva);
                         writeln!(buf, "\t|-RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{ptr:X}").ok();
                     } else {
-                        writeln!(buf, "\t|-RVA: -1 Offset: -1").ok();
+                        writeln!(buf, "\t|-RVA: 0x0 Offset: 0x0").ok();
                     }
 
                     for spec_idx in spec_indices {

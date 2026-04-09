@@ -396,9 +396,24 @@ impl Il2CppExecutor {
     ) -> (String, String) {
         let method_spec = il2cpp.method_specs[method_spec_index].clone();
 
-        let method_def = metadata.method_defs[method_spec.method_definition_index as usize].clone();
-        let type_def = metadata.type_defs[method_def.declaring_type as usize].clone();
-        let type_def_index = method_def.declaring_type as usize;
+        let method_def_index = method_spec.method_definition_index;
+        if method_def_index < 0 || method_def_index as usize >= metadata.method_defs.len() {
+            return (
+                format!("UnknownType_MethodSpec{method_spec_index}"),
+                "UnknownMethod".to_string(),
+            );
+        }
+        let method_def = metadata.method_defs[method_def_index as usize].clone();
+
+        let declaring_type_index = method_def.declaring_type;
+        if declaring_type_index < 0 || declaring_type_index as usize >= metadata.type_defs.len() {
+            return (
+                format!("UnknownType_MethodSpec{method_spec_index}"),
+                "UnknownMethod".to_string(),
+            );
+        }
+        let type_def = metadata.type_defs[declaring_type_index as usize].clone();
+        let type_def_index = declaring_type_index as usize;
 
         let mut type_name = self.get_type_def_name(&type_def, type_def_index, metadata, il2cpp, add_namespace, false);
 
@@ -568,12 +583,19 @@ impl Il2CppExecutor {
         il2cpp: &Il2Cpp,
     ) -> Option<Il2CppTypeDefinition> {
         if il2cpp.version >= 27.0 && il2cpp.is_dumped {
-            let offset = il2cpp_type.type_handle()
+            let handle = il2cpp_type.type_handle();
+            let raw_offset = handle
                 .wrapping_sub(il2cpp.image_base)
                 .wrapping_sub(metadata.header.type_definitions_offset as u64);
+
+            if !metadata.type_def_offset_to_index.is_empty() {
+                let index = metadata.type_def_offset_to_index.get(&raw_offset)?;
+                return metadata.type_defs.get(*index).cloned();
+            }
+
             let td_size = Il2CppTypeDefinition::byte_size(metadata.version) as u64;
             if td_size == 0 { return None; }
-            let index = (offset / td_size) as usize;
+            let index = (raw_offset / td_size) as usize;
             return metadata.type_defs.get(index).cloned();
         }
         let klass_index = il2cpp_type.klass_index() as i64;
@@ -590,12 +612,19 @@ impl Il2CppExecutor {
         il2cpp: &Il2Cpp,
     ) -> Option<Il2CppGenericParameter> {
         if il2cpp.version >= 27.0 && il2cpp.is_dumped {
-            let offset = il2cpp_type.generic_parameter_handle()
+            let handle = il2cpp_type.generic_parameter_handle();
+            let raw_offset = handle
                 .wrapping_sub(il2cpp.image_base)
                 .wrapping_sub(metadata.header.generic_parameters_offset as u64);
-            let param_size = Il2CppGenericParameter::byte_size() as u64;
+
+            if !metadata.generic_param_offset_to_index.is_empty() {
+                let index = metadata.generic_param_offset_to_index.get(&raw_offset)?;
+                return metadata.generic_parameters.get(*index).cloned();
+            }
+
+            let param_size = Il2CppGenericParameter::byte_size(metadata.version) as u64;
             if param_size == 0 { return None; }
-            let index = (offset / param_size) as usize;
+            let index = (raw_offset / param_size) as usize;
             return metadata.generic_parameters.get(index).cloned();
         }
         let param_index = il2cpp_type.generic_parameter_index() as i64;

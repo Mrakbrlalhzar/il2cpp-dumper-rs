@@ -32,7 +32,7 @@ struct StructVTableMethodInfo {
 }
 
 struct StructRGCTXInfo {
-    rgctx_type: i32,
+    rgctx_type: i64,
     type_name: Option<String>,
     class_name: Option<String>,
     method_name: Option<String>,
@@ -1270,26 +1270,25 @@ impl StructGenerator {
         let collection = executor.get_rgctx_definition_for_type(&image_name, type_def, metadata, il2cpp);
         if let Some(definitions) = collection {
             for def in &definitions {
-                let rgctx_type_val = def.rgctx_type();
+                let rgctx_type_val = def.rgctx_type;
                 let mut rgctx_info = StructRGCTXInfo {
                     rgctx_type: rgctx_type_val,
                     type_name: None,
                     class_name: None,
                     method_name: None,
                 };
-                // For v27.2+, data is at data_ptr (needs MapVATR), for older, it's inline
-                let rgctx_data_type_index: Option<i32> = if il2cpp.version >= 27.2 {
-                    if def.data_ptr != 0 {
-                        if let Ok(offset) = il2cpp.map_vatr(def.data_ptr as u64) {
-                            il2cpp.stream.set_position(offset);
-                            il2cpp.stream.read_i32().ok()
-                        } else { None }
+                let rgctx_data_type_index: Option<i32> = if def.def_data.is_some() {
+                    def.def_data.as_ref().map(|d| d.rgctx_data_dummy)
+                } else if def.constrained_data.is_some() {
+                    def.constrained_data.as_ref().map(|d| d.type_index)
+                } else if def.data_va != 0 {
+                    if let Ok(offset) = il2cpp.map_vatr(def.data_va) {
+                        il2cpp.stream.set_position(offset);
+                        il2cpp.stream.read_i32().ok()
                     } else { None }
-                } else {
-                    def.data.as_ref().map(|d| d.rgctx_data_dummy)
-                };
+                } else { None };
                 if let Some(data_index) = rgctx_data_type_index {
-                    match rgctx_type_val {
+                    match rgctx_type_val as i32 {
                         1 => {
                             let type_idx = data_index as usize;
                             if type_idx < il2cpp.types.len() {
@@ -1369,7 +1368,7 @@ impl StructGenerator {
         if !info.rgctxs.is_empty() {
             writeln!(buf, "struct {}_RGCTXs {{", info.type_name).ok();
             for (i, rgctx) in info.rgctxs.iter().enumerate() {
-                match rgctx.rgctx_type {
+                match rgctx.rgctx_type as i32 {
                     1 => {
                         let tn = rgctx.type_name.as_deref().unwrap_or("unknown");
                         writeln!(buf, "\tIl2CppType* _{}_{};", i, tn).ok();
@@ -1460,17 +1459,19 @@ impl StructGenerator {
         let collection = executor.get_rgctx_definition_for_method(image_name, method_def, metadata, il2cpp);
         if let Some(definitions) = collection {
             for def in &definitions {
-                let rgctx_type_val = def.rgctx_type();
+                let rgctx_type_val = def.rgctx_type;
                 let mut rgctx_info = StructRGCTXInfo {
                     rgctx_type: rgctx_type_val,
                     type_name: None,
                     class_name: None,
                     method_name: None,
                 };
-                if let Some(data) = &def.data {
-                    match rgctx_type_val {
+                let type_idx_val = def.type_index();
+                let data_index: Option<i32> = if type_idx_val == -1 { None } else { Some(type_idx_val) };
+                if let Some(data_val) = data_index {
+                    match rgctx_type_val as i32 {
                         1 => {
-                            let type_idx = data.type_index() as usize;
+                            let type_idx = data_val as usize;
                             if type_idx < il2cpp.types.len() {
                                 let il2cpp_type = il2cpp.types[type_idx].clone();
                                 let name = executor.get_type_name(&il2cpp_type, metadata, il2cpp, true, false);
@@ -1478,7 +1479,7 @@ impl StructGenerator {
                             }
                         }
                         2 => {
-                            let type_idx = data.type_index() as usize;
+                            let type_idx = data_val as usize;
                             if type_idx < il2cpp.types.len() {
                                 let il2cpp_type = il2cpp.types[type_idx].clone();
                                 let name = executor.get_type_name(&il2cpp_type, metadata, il2cpp, true, false);
@@ -1486,7 +1487,7 @@ impl StructGenerator {
                             }
                         }
                         3 => {
-                            let method_idx = data.method_index() as usize;
+                            let method_idx = data_val as usize;
                             if method_idx < il2cpp.method_specs.len() {
                                 let (type_name, method_name) = executor.get_method_spec_name(method_idx, metadata, il2cpp, true);
                                 rgctx_info.method_name = Some(fix_name(&format!("{}.{}", type_name, method_name)));
@@ -1511,7 +1512,7 @@ impl StructGenerator {
         if !rgctxs.is_empty() {
             writeln!(buf, "struct {}_RGCTXs {{", method_info_name).ok();
             for (i, rgctx) in rgctxs.iter().enumerate() {
-                match rgctx.rgctx_type {
+                match rgctx.rgctx_type as i32 {
                     1 => {
                         let tn = rgctx.type_name.as_deref().unwrap_or("unknown");
                         writeln!(buf, "\tIl2CppType* _{}_{};", i, tn).ok();

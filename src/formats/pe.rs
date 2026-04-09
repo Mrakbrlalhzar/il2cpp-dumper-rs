@@ -242,10 +242,18 @@ impl Pe {
 
             all_sections.push(search_section.clone());
 
-            match section.characteristics {
-                0x60000020 => exec_list.push(search_section),
-                0x40000040 | 0xC0000040 => data_list.push(search_section),
-                _ => {}
+            let chars = section.characteristics;
+            let is_code = (chars & IMAGE_SCN_CNT_CODE) != 0 || (chars & IMAGE_SCN_MEM_EXECUTE) != 0;
+            let is_data = (chars & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+
+            if is_code && !is_data {
+
+                exec_list.push(search_section);
+            } else if is_data && !is_code {
+
+                data_list.push(search_section);
+            } else {
+
             }
         }
 

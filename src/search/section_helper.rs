@@ -26,7 +26,7 @@ pub struct SectionHelper<'a> {
     method_count: usize,
     type_definitions_count: usize,
     _metadata_usages_count: usize,
-    image_count: usize,
+    _image_count: usize,
     pointer_in_exec: bool,
 }
 
@@ -43,7 +43,7 @@ impl<'a> SectionHelper<'a> {
         method_count: usize,
         type_definitions_count: usize,
         metadata_usages_count: usize,
-        image_count: usize,
+        _image_count: usize,
     ) -> Self {
         Self {
             data,
@@ -57,7 +57,7 @@ impl<'a> SectionHelper<'a> {
             method_count,
             type_definitions_count,
             _metadata_usages_count: metadata_usages_count,
-            image_count,
+            _image_count,
             pointer_in_exec: false,
         }
     }
@@ -101,8 +101,8 @@ impl<'a> SectionHelper<'a> {
         self.find_metadata_registration_old()
     }
 
-    fn offset_to_va(&self, offset: usize) -> Option<u64> {
-        for section in &self.data_sections {
+    fn offset_to_va_any(&self, offset: usize) -> Option<u64> {
+        for section in &self._sections {
             if offset as u64 >= section.offset && (offset as u64) < section.offset_end {
                 return Some(offset as u64 - section.offset + section.address);
             }
@@ -110,7 +110,7 @@ impl<'a> SectionHelper<'a> {
         None
     }
 
-    fn find_refs_fast(&self, addr: u64) -> Vec<(usize, u64)> {
+    fn find_all_mapped_words(&self, addr: u64) -> Vec<u64> {
         let ptr_size = self.ptr_size();
         let addr_bytes = if self.is_32bit {
             (addr as u32).to_le_bytes().to_vec()
@@ -118,19 +118,20 @@ impl<'a> SectionHelper<'a> {
             addr.to_le_bytes().to_vec()
         };
 
-        let mut refs = Vec::new();
+        let mut results = Vec::new();
         let mut start = 0;
         while let Some(idx) = find_bytes(&self.data[start..], &addr_bytes) {
             let abs_idx = start + idx;
             if abs_idx % ptr_size == 0 {
-                if let Some(va) = self.offset_to_va(abs_idx) {
-                    refs.push((abs_idx, va));
+                if let Some(va) = self.offset_to_va_any(abs_idx) {
+                    results.push(va);
                 }
             }
             start = abs_idx + 1;
         }
-        refs
+        results
     }
+
 
     fn search_bytes_iter(data: &[u8], pattern: &[u8]) -> Vec<usize> {
         let mut results = Vec::new();
@@ -143,10 +144,23 @@ impl<'a> SectionHelper<'a> {
     }
 
     fn find_code_registration_2019(&self, use_exec: &bool) -> Option<u64> {
+        let result = self.find_code_registration_2019_with_feature(use_exec, b"mscorlib.dll\x00");
+        if result.is_some() {
+            return result;
+        }
+        self.find_code_registration_2019_with_feature(use_exec, b"System.Private.CoreLib.dll\x00")
+    }
+
+    fn find_code_registration_2019_with_feature(&self, use_exec: &bool, feature_bytes: &[u8]) -> Option<u64> {
+        use crate::il2cpp::structures::Il2CppCodeRegistration;
         let ptr_size = self.ptr_size();
-        let feature_bytes = b"mscorlib.dll\x00";
+        let struct_size = Il2CppCodeRegistration::struct_size(self.is_32bit, self.version);
+        let _feature_name = std::str::from_utf8(&feature_bytes[..feature_bytes.len()-1]).unwrap_or("?");
 
         let sections = if *use_exec { &self.code_sections } else { &self.data_sections };
+
+
+        let mut all_module_list_entries: Vec<u64> = Vec::new();
 
         for section in sections {
             let start = section.offset as usize;
@@ -156,61 +170,127 @@ impl<'a> SectionHelper<'a> {
             }
             let section_data = &self.data[start..end];
 
-            for index in Self::search_bytes_iter(section_data, feature_bytes) {
-                let dll_va = index as u64 + section.address;
+            let string_hits = Self::search_bytes_iter(section_data, feature_bytes);
+            if string_hits.is_empty() {
+                continue;
+            }
 
-                let refs1 = self.find_refs_fast(dll_va);
 
-                for (_, ref_va) in &refs1 {
-                    let refs2 = self.find_refs_fast(*ref_va);
+            for index in &string_hits {
+                let dll_va = *index as u64 + section.address;
 
-                    for (_ref_offset2, ref_va2) in &refs2 {
-                        if self.version >= 27.0 {
-                            let min_target = ref_va2 - (self.image_count as u64 - 1) * ptr_size as u64;
-                            let max_target = *ref_va2;
 
-                            let count_bytes = if self.is_32bit {
-                                (self.image_count as u32).to_le_bytes().to_vec()
-                            } else {
-                                (self.image_count as u64).to_le_bytes().to_vec()
-                            };
+                let refs1 = self.find_all_mapped_words(dll_va);
 
-                            let mut start_search = 0usize;
-                            while let Some(idx) = find_bytes(&self.data[start_search..], &count_bytes) {
-                                let abs_idx = start_search + idx;
-                                if abs_idx % ptr_size == 0 {
-                                    let next_offset = abs_idx + ptr_size;
-                                    if next_offset + ptr_size <= self.data.len() {
-                                        let ptr_val = self.read_ptr_at(next_offset);
-                                        if let Some(pv) = ptr_val {
-                                            if pv >= min_target && pv <= max_target {
-                                                let i = (ref_va2 - pv) / ptr_size as u64;
-                                                if i < self.image_count as u64 && pv == ref_va2 - i * ptr_size as u64 {
-                                                    if let Some(ref_va3) = self.offset_to_va(next_offset) {
-                                                        if self.version >= 29.1 {
-                                                            return Some(ref_va3 - ptr_size as u64 * 16);
-                                                        } else if self.version >= 29.0 {
-                                                            return Some(ref_va3 - ptr_size as u64 * 14);
-                                                        }
-                                                        return Some(ref_va3 - ptr_size as u64 * 13);
-                                                    }
-                                                }
-                                            }
+
+                for ref_va in &refs1 {
+
+                    let refs2 = self.find_all_mapped_words(*ref_va);
+
+
+                    for entry_va in &refs2 {
+
+                        all_module_list_entries.push(*entry_va);
+                    }
+                }
+            }
+        }
+
+        if all_module_list_entries.is_empty() {
+
+            return None;
+        }
+
+        if self.version >= 27.0 {
+            let sanity_limit = 500usize;
+            let entry_va = all_module_list_entries[0];
+
+
+
+            for section in &self._sections {
+                let start = section.offset as usize;
+                let end = section.offset_end as usize;
+                if start >= self.data.len() || end > self.data.len() {
+                    continue;
+                }
+
+                let mut pos = start;
+                while pos + ptr_size <= end {
+                    if pos % ptr_size != 0 {
+                        pos += 1;
+                        continue;
+                    }
+
+                    let ptr_val = if self.is_32bit {
+                        u32::from_le_bytes([
+                            self.data[pos], self.data[pos+1],
+                            self.data[pos+2], self.data[pos+3],
+                        ]) as u64
+                    } else {
+                        u64::from_le_bytes([
+                            self.data[pos], self.data[pos+1],
+                            self.data[pos+2], self.data[pos+3],
+                            self.data[pos+4], self.data[pos+5],
+                            self.data[pos+6], self.data[pos+7],
+                        ])
+                    };
+
+                    if ptr_val <= entry_va && ptr_val > 0 {
+                        let diff = entry_va - ptr_val;
+                        if diff % ptr_size as u64 == 0 {
+                            let index = diff / ptr_size as u64;
+                            if index < sanity_limit as u64 {
+                                let count_offset = if pos >= ptr_size { pos - ptr_size } else { pos += ptr_size; continue; };
+                                let count_val = if self.is_32bit {
+                                    if count_offset + 4 > self.data.len() { pos += ptr_size; continue; }
+                                    u32::from_le_bytes([
+                                        self.data[count_offset], self.data[count_offset+1],
+                                        self.data[count_offset+2], self.data[count_offset+3],
+                                    ]) as i64
+                                } else {
+                                    if count_offset + 4 > self.data.len() { pos += ptr_size; continue; }
+                                    i32::from_le_bytes([
+                                        self.data[count_offset], self.data[count_offset+1],
+                                        self.data[count_offset+2], self.data[count_offset+3],
+                                    ]) as i64
+                                };
+
+                                if count_val > 0 && (count_val as usize) <= sanity_limit && (index as i64) < count_val {
+                                    let array_end_va = ptr_val + count_val as u64 * ptr_size as u64;
+                                    let mut all_entries_valid = true;
+                                    for me in &all_module_list_entries {
+                                        if *me < ptr_val || *me >= array_end_va {
+                                            all_entries_valid = false;
+                                            break;
                                         }
                                     }
-                                }
-                                start_search = abs_idx + 1;
-                            }
-                        } else {
-                            for i in 0..self.image_count {
-                                let target = ref_va2 - (i as u64) * ptr_size as u64;
-                                let refs3 = self.find_refs_fast(target);
-                                for (_, ref_va3) in &refs3 {
-                                    return Some(ref_va3 - ptr_size as u64 * 13);
+                                    if !all_entries_valid {
+                                        pos += ptr_size;
+                                        continue;
+                                    }
+
+                                    if let Some(field_va) = self.offset_to_va_any(pos) {
+                                        let bytes_to_go_back = struct_size - ptr_size;
+                                        let code_reg = field_va - bytes_to_go_back as u64;
+
+                                        return Some(code_reg);
+                                    }
                                 }
                             }
                         }
                     }
+
+                    pos += ptr_size;
+                }
+            }
+
+
+        } else {
+            if let Some(entry_va) = all_module_list_entries.first() {
+                let refs = self.find_all_mapped_words(*entry_va);
+                for ptr_va in &refs {
+                    let bytes_to_go_back = struct_size - ptr_size;
+                    return Some(ptr_va - bytes_to_go_back as u64);
                 }
             }
         }
