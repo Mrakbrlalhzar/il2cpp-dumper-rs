@@ -1273,8 +1273,16 @@ impl Il2CppRGCTXDefinition {
 pub struct Il2CppCodeRegistration {
     pub method_pointers_count: u64,
     pub method_pointers: u64,
+    pub delegate_wrappers_from_native_to_managed_count: u64,
+    pub delegate_wrappers_from_native_to_managed: u64,
     pub reverse_pinvoke_wrapper_count: u64,
     pub reverse_pinvoke_wrappers: u64,
+    pub delegate_wrappers_from_managed_to_native_count: u64,
+    pub delegate_wrappers_from_managed_to_native: u64,
+    pub marshaling_functions_count: u64,
+    pub marshaling_functions: u64,
+    pub ccw_marshaling_functions_count: u64,
+    pub ccw_marshaling_functions: u64,
     pub generic_method_pointers_count: u64,
     pub generic_method_pointers: u64,
     pub generic_adjustor_thunks: u64,
@@ -1282,6 +1290,8 @@ pub struct Il2CppCodeRegistration {
     pub invoker_pointers: u64,
     pub custom_attribute_count: u64,
     pub custom_attribute_generators: u64,
+    pub guid_count: u64,
+    pub guids: u64,
     pub unresolved_virtual_call_count: u64,
     pub unresolved_virtual_call_pointers: u64,
     pub unresolved_instance_call_pointers: u64,
@@ -1296,92 +1306,54 @@ pub struct Il2CppCodeRegistration {
 
 impl Il2CppCodeRegistration {
     pub fn read(stream: &mut BinaryStream, version: f64) -> Result<Self> {
-        let method_pointers_count = if version <= 24.15 { stream.read_ptr()? } else { 0 };
-        let method_pointers = if version <= 24.15 { stream.read_ptr()? } else { 0 };
-
-        let reverse_pinvoke_wrapper_count = stream.read_ptr()?;
-        let reverse_pinvoke_wrappers = stream.read_ptr()?;
-
-        let generic_method_pointers_count = stream.read_ptr()?;
-        let generic_method_pointers = stream.read_ptr()?;
-
-        let generic_adjustor_thunks = if (version >= 24.5 && version < 27.0) || version >= 27.1 {
-            stream.read_ptr()?
-        } else {
-            0
-        };
-
-        let invoker_pointers_count = stream.read_ptr()?;
-        let invoker_pointers = stream.read_ptr()?;
-
-        let custom_attribute_count = if version <= 24.5 { stream.read_ptr()? } else { 0 };
-        let custom_attribute_generators = if version <= 24.5 { stream.read_ptr()? } else { 0 };
-
-        let unresolved_virtual_call_count = stream.read_ptr()?;
-        let unresolved_virtual_call_pointers = stream.read_ptr()?;
-
-        let has_unresolved_indirect = (version >= 29.1 && version < 31.0) || version >= 31.1;
-        let unresolved_instance_call_pointers = if has_unresolved_indirect { stream.read_ptr()? } else { 0 };
-        let unresolved_static_call_pointers = if has_unresolved_indirect { stream.read_ptr()? } else { 0 };
-
-        let interop_data_count = if version >= 23.0 { stream.read_ptr()? } else { 0 };
-        let interop_data = if version >= 23.0 { stream.read_ptr()? } else { 0 };
-
-        let windows_runtime_factory_count;
-        let windows_runtime_factory_table;
-        let code_gen_modules_count;
-        let code_gen_modules;
-
-        if version >= 24.2 {
-            if version >= 24.3 {
-                windows_runtime_factory_count = stream.read_ptr()?;
-                windows_runtime_factory_table = stream.read_ptr()?;
-            } else {
-                windows_runtime_factory_count = 0;
-                windows_runtime_factory_table = 0;
-            }
-            code_gen_modules_count = stream.read_ptr()?;
-            code_gen_modules = stream.read_ptr()?;
-        } else {
-            windows_runtime_factory_count = 0;
-            windows_runtime_factory_table = 0;
-            code_gen_modules_count = 0;
-            code_gen_modules = 0;
-        }
-
         Ok(Self {
-            method_pointers_count,
-            method_pointers,
-            reverse_pinvoke_wrapper_count,
-            reverse_pinvoke_wrappers,
-            generic_method_pointers_count,
-            generic_method_pointers,
-            generic_adjustor_thunks,
-            invoker_pointers_count,
-            invoker_pointers,
-            custom_attribute_count,
-            custom_attribute_generators,
-            unresolved_virtual_call_count,
-            unresolved_virtual_call_pointers,
-            unresolved_instance_call_pointers,
-            unresolved_static_call_pointers,
-            interop_data_count,
-            interop_data,
-            windows_runtime_factory_count,
-            windows_runtime_factory_table,
-            code_gen_modules_count,
-            code_gen_modules,
+            method_pointers_count: if version <= 24.1 { stream.read_ptr()? } else { 0 },
+            method_pointers: if version <= 24.1 { stream.read_ptr()? } else { 0 },
+            delegate_wrappers_from_native_to_managed_count: if version <= 21.0 { stream.read_ptr()? } else { 0 },
+            delegate_wrappers_from_native_to_managed: if version <= 21.0 { stream.read_ptr()? } else { 0 },
+            reverse_pinvoke_wrapper_count: if version >= 22.0 { stream.read_ptr()? } else { 0 },
+            reverse_pinvoke_wrappers: if version >= 22.0 { stream.read_ptr()? } else { 0 },
+            delegate_wrappers_from_managed_to_native_count: if version <= 22.0 { stream.read_ptr()? } else { 0 },
+            delegate_wrappers_from_managed_to_native: if version <= 22.0 { stream.read_ptr()? } else { 0 },
+            marshaling_functions_count: if version <= 22.0 { stream.read_ptr()? } else { 0 },
+            marshaling_functions: if version <= 22.0 { stream.read_ptr()? } else { 0 },
+            ccw_marshaling_functions_count: if version >= 21.0 && version <= 22.0 { stream.read_ptr()? } else { 0 },
+            ccw_marshaling_functions: if version >= 21.0 && version <= 22.0 { stream.read_ptr()? } else { 0 },
+            generic_method_pointers_count: stream.read_ptr()?,
+            generic_method_pointers: stream.read_ptr()?,
+            generic_adjustor_thunks: if version >= 24.5 { stream.read_ptr()? } else { 0 },
+            invoker_pointers_count: stream.read_ptr()?,
+            invoker_pointers: stream.read_ptr()?,
+            custom_attribute_count: if version <= 24.5 { stream.read_ptr()? } else { 0 },
+            custom_attribute_generators: if version <= 24.5 { stream.read_ptr()? } else { 0 },
+            guid_count: if version >= 21.0 && version <= 22.0 { stream.read_ptr()? } else { 0 },
+            guids: if version >= 21.0 && version <= 22.0 { stream.read_ptr()? } else { 0 },
+            unresolved_virtual_call_count: if version >= 22.0 { stream.read_ptr()? } else { 0 },
+            unresolved_virtual_call_pointers: if version >= 22.0 { stream.read_ptr()? } else { 0 },
+            unresolved_instance_call_pointers: if version >= 29.1 { stream.read_ptr()? } else { 0 },
+            unresolved_static_call_pointers: if version >= 29.1 { stream.read_ptr()? } else { 0 },
+            interop_data_count: if version >= 23.0 { stream.read_ptr()? } else { 0 },
+            interop_data: if version >= 23.0 { stream.read_ptr()? } else { 0 },
+            windows_runtime_factory_count: if version >= 24.3 { stream.read_ptr()? } else { 0 },
+            windows_runtime_factory_table: if version >= 24.3 { stream.read_ptr()? } else { 0 },
+            code_gen_modules_count: if version >= 24.2 { stream.read_ptr()? } else { 0 },
+            code_gen_modules: if version >= 24.2 { stream.read_ptr()? } else { 0 },
         })
     }
 
     pub fn field_count(version: f64) -> usize {
         let mut count = 0usize;
-        if version <= 24.15 { count += 2; }
-        count += 6;
-        if (version >= 24.5 && version < 27.0) || version >= 27.1 { count += 1; }
+        if version <= 24.1 { count += 2; }
+        if version <= 21.0 { count += 2; }
+        if version >= 22.0 { count += 2; }
+        if version <= 22.0 { count += 4; }
+        if version >= 21.0 && version <= 22.0 { count += 2; }
+        count += 4;
+        if version >= 24.5 { count += 1; }
         if version <= 24.5 { count += 2; }
-        count += 2;
-        if (version >= 29.1 && version < 31.0) || version >= 31.1 { count += 2; }
+        if version >= 21.0 && version <= 22.0 { count += 2; }
+        if version >= 22.0 { count += 2; }
+        if version >= 29.1 { count += 2; }
         if version >= 23.0 { count += 2; }
         if version >= 24.3 { count += 2; }
         if version >= 24.2 { count += 2; }

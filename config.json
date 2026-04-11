@@ -11,8 +11,8 @@
   "generateDummyDll": true,
   "dummyDllAddToken": true,
   "requireAnyKey": true,
-  "forceIl2cppVersion": true,
-  "forceVersion": 31.1,
+  "forceIl2cppVersion": false,
+  "forceVersion": 31.0,
   "forceDump": false,
   "noRedirectedPointer": false,
   "splitDumpPerType": true
