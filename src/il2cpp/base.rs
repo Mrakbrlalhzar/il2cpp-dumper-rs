@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use crate::io::BinaryStream;
 use crate::error::{Result, Error};
 use crate::search::SearchSection;
+use crate::disassembler::Architecture;
 use super::structures::*;
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,8 @@ pub struct Il2Cpp {
     pub is_pe: bool,
     pub reverse_pinvoke_wrappers: Vec<u64>,
     pub unresolved_virtual_call_pointers: Vec<u64>,
+    pub arch: Option<Architecture>,
+    pub e_machine: u16,
 }
 
 impl Il2Cpp {
@@ -85,6 +88,8 @@ impl Il2Cpp {
             is_pe: false,
             reverse_pinvoke_wrappers: Vec::new(),
             unresolved_virtual_call_pointers: Vec::new(),
+            arch: None,
+            e_machine: 0,
         }
     }
 
@@ -137,6 +142,8 @@ impl Il2Cpp {
             is_pe: false,
             reverse_pinvoke_wrappers: Vec::new(),
             unresolved_virtual_call_pointers: Vec::new(),
+            arch: Architecture::from_elf_machine(elf.header.e_machine),
+            e_machine: elf.header.e_machine,
         }
     }
 
@@ -449,5 +456,91 @@ impl Il2Cpp {
             result.push(self.stream.read_ptr()?);
         }
         Ok(result)
+    }
+
+    pub fn detect_architecture(&self) -> Architecture {
+        if let Some(arch) = self.arch {
+            return arch;
+        }
+        Architecture::from_bitness(self.is_32bit, self.is_pe)
+    }
+
+    pub fn build_sorted_method_addresses(&self) -> Vec<u64> {
+        let mut addrs = BTreeSet::new();
+
+        for &ptr in &self.method_pointers {
+            if ptr > 0 {
+                addrs.insert(self.get_rva(ptr));
+            }
+        }
+
+        for &ptr in &self.generic_method_pointers {
+            if ptr > 0 {
+                addrs.insert(self.get_rva(ptr));
+            }
+        }
+
+        for ptrs in self.code_gen_module_method_pointers.values() {
+            for &ptr in ptrs {
+                if ptr > 0 {
+                    addrs.insert(self.get_rva(ptr));
+                }
+            }
+        }
+
+        for (&_spec_idx, &ptr) in &self.method_spec_generic_method_pointers {
+            if ptr > 0 {
+                addrs.insert(self.get_rva(ptr));
+            }
+        }
+
+        addrs.into_iter().collect()
+    }
+
+    pub fn get_method_body_size(&self, rva: u64, sorted_addrs: &[u64]) -> usize {
+        const MAX_BODY: usize = 0x4000;
+        const MIN_BODY: usize = 4;
+
+        match sorted_addrs.binary_search(&rva) {
+            Ok(idx) => {
+                if idx + 1 < sorted_addrs.len() {
+                    let next = sorted_addrs[idx + 1];
+                    let diff = (next - rva) as usize;
+                    diff.min(MAX_BODY).max(MIN_BODY)
+                } else {
+                    MAX_BODY
+                }
+            }
+            Err(_) => MAX_BODY,
+        }
+    }
+
+    pub fn read_bytes_at_rva(&self, rva: u64, size: usize) -> Option<Vec<u8>> {
+        let va = if self.image_base > 0 {
+            rva.wrapping_add(self.image_base)
+        } else {
+            rva
+        };
+
+        let file_offset = match self.map_vatr(va) {
+            Ok(o) => o,
+            Err(_) => {
+                if rva < self.stream.len() {
+                    rva
+                } else {
+                    return None;
+                }
+            }
+        };
+
+        let data = self.stream.data();
+        let start = file_offset as usize;
+        let end = (start + size).min(data.len());
+
+        if start >= data.len() {
+            return None;
+        }
+
+        Some(data[start..end].to_vec())
     }
 }

@@ -48,8 +48,14 @@ fn read_magic_u16(data: &[u8]) -> u16 {
     u16::from_le_bytes([data[0], data[1]])
 }
 
+fn is_valid_metadata_version(data: &[u8]) -> bool {
+    if data.len() < 8 { return false; }
+    let ver = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    ver > 0 && ver < 200
+}
+
 fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
-    if data.len() < 8 {
+    if data.len() < 16 {
         return None;
     }
 
@@ -57,23 +63,88 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
 
     let k1 = magic[0] ^ data[0];
     if k1 != 0 && (1..4).all(|i| (magic[i] ^ data[i]) == k1) {
-        for b in data.iter_mut() { *b ^= k1; }
-        return Some(format!("Single-byte XOR (key: 0x{k1:02X})"));
+        let mut test = data.clone();
+        for b in test.iter_mut() { *b ^= k1; }
+        if is_valid_metadata_version(&test) {
+            *data = test;
+            return Some(format!("Single-byte XOR (key: 0x{k1:02X})"));
+        }
     }
 
     let key4: [u8; 4] = std::array::from_fn(|i| magic[i] ^ data[i]);
-    if key4 != [0u8; 4] && key4.iter().any(|&b| b != 0) {
-        let _consistent = data[..8].iter().enumerate().all(|(i, &b)| {
-            (key4[i % 4] ^ b) == if i < 4 { magic[i] } else { 0 ^ b ^ key4[i % 4] ^ b }
-        });
-        let check: [u8; 4] = std::array::from_fn(|i| data[i] ^ key4[i]);
-        if check == magic {
-            let all_same = key4.windows(2).all(|w| w[0] == w[1]);
-            if !all_same {
-                for (i, b) in data.iter_mut().enumerate() { *b ^= key4[i % 4]; }
-                return Some(format!("4-byte XOR (key: {:02X}{:02X}{:02X}{:02X})",
-                    key4[0], key4[1], key4[2], key4[3]));
+    if key4 != [0u8; 4] && !key4.windows(2).all(|w| w[0] == w[1]) {
+        let mut test = data.clone();
+        for (i, b) in test.iter_mut().enumerate() { *b ^= key4[i % 4]; }
+        if is_valid_metadata_version(&test) {
+            *data = test;
+            return Some(format!("4-byte XOR (key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]));
+        }
+    }
+
+    let key8: [u8; 8] = std::array::from_fn(|i| {
+        if i < 4 { magic[i] ^ data[i] } else { data[i] }
+    });
+    if key8[0..4] != [0u8; 4] {
+        let expected_ver_bytes: Vec<u8> = (4..8).map(|i| data[i] ^ key8[i]).collect();
+        let test_ver = i32::from_le_bytes([expected_ver_bytes[0], expected_ver_bytes[1], expected_ver_bytes[2], expected_ver_bytes[3]]);
+        if test_ver > 0 && test_ver < 200 {
+            let mut test = data.clone();
+            for (i, b) in test.iter_mut().enumerate() { *b ^= key8[i % 8]; }
+            if is_valid_metadata_version(&test) {
+                *data = test;
+                return Some(format!("8-byte XOR (key: {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X})",
+                    key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7]));
             }
+        }
+    }
+
+    for key_len in [16usize, 32, 64, 128, 256] {
+        if data.len() < key_len * 2 { continue; }
+        let key: Vec<u8> = (0..key_len).map(|i| if i < 4 { magic[i] ^ data[i] } else { data[i] ^ 0 }).collect();
+        if key[0..4] == [0u8; 4] { continue; }
+        let mut test = data[..8].to_vec();
+        for (i, b) in test.iter_mut().enumerate() { *b ^= key[i % key_len]; }
+        if &test[0..4] == &magic && is_valid_metadata_version(&test) {
+            for (i, b) in data.iter_mut().enumerate() { *b ^= key[i % key_len]; }
+            return Some(format!("{key_len}-byte rolling XOR key"));
+        }
+    }
+
+    {
+        let mut test = data.clone();
+        for (i, b) in test.iter_mut().enumerate() {
+            *b ^= key4[i % 4] ^ (i as u8);
+        }
+        if &test[0..4] == &magic && is_valid_metadata_version(&test) {
+            *data = test;
+            return Some(format!("Position-dependent XOR (base key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]));
+        }
+    }
+
+    {
+        let mut test = data.clone();
+        for (i, b) in test.iter_mut().enumerate() {
+            *b ^= key4[i % 4] ^ ((i & 0xFF) as u8);
+        }
+        if &test[0..4] == &magic && is_valid_metadata_version(&test) {
+            *data = test;
+            return Some(format!("Masked position XOR (base key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]));
+        }
+    }
+
+    {
+        let header_size = 256usize.min(data.len());
+        let mut test = data.clone();
+        for i in 0..header_size {
+            test[i] ^= key4[i % 4];
+        }
+        if &test[0..4] == &magic && is_valid_metadata_version(&test) {
+            *data = test;
+            return Some(format!("Header-only XOR ({header_size} bytes, key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]));
         }
     }
 
@@ -290,6 +361,12 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     let mut il2cpp = Il2Cpp::new(pe.stream.clone(), version, pe.is_32bit);
     il2cpp.va_segments = va_segments;
     il2cpp.image_base = pe_image_base;
+    il2cpp.is_pe = true;
+    il2cpp.arch = Some(if pe.is_32bit {
+        il2cpp_dumper::disassembler::Architecture::X86
+    } else {
+        il2cpp_dumper::disassembler::Architecture::X64
+    });
     il2cpp.init(cr_addr, mr_addr, &|addr| pe.map_vatr(addr))?;
     Ok(il2cpp)
 }
@@ -590,6 +667,18 @@ fn run() -> Result<()> {
             &mut executor, &mut metadata, &mut il2cpp, &config, &output_dir,
         )?;
         println!("Dummy dll files generated");
+    }
+
+    if config.generate_generics_dump {
+        println!("Generating generics dump...");
+        let generics_path = std::path::Path::new(&output_dir).join("generics_dump.txt");
+        if let Err(e) = il2cpp_dumper::output::generics::dump_generics(
+            &generics_path.to_string_lossy(), &mut metadata, &mut il2cpp, &mut executor, &config
+        ) {
+            eprintln!("Warning: Failed to generate generics_dump.txt: {}", e);
+        } else {
+            println!("generics_dump.txt generated");
+        }
     }
 
     let elapsed = start_time.elapsed();

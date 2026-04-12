@@ -102,7 +102,7 @@ pub struct Elf {
     pub stream: BinaryStream,
     pub is_32bit: bool,
     pub is_dumped: bool,
-    header: ElfHeader,
+    pub header: ElfHeader,
     pub segments: Vec<ElfPhdr>,
     dynamic: Vec<ElfDyn>,
     symbols: Vec<ElfSym>,
@@ -168,7 +168,7 @@ impl Elf {
             metadata_usages_count: 0,
         };
         elf.stream.is_32bit = is_32bit;
-        elf.load()?;
+        let _ = elf.load();
         Ok(elf)
     }
 

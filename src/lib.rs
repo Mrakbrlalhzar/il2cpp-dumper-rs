@@ -7,3 +7,4 @@ pub mod search;
 pub mod utils;
 pub mod executor;
 pub mod output;
+pub mod disassembler;

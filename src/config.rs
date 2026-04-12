@@ -20,6 +20,20 @@ pub struct Config {
     pub force_dump: bool,
     pub no_redirected_pointer: bool,
     pub split_dump_per_type: bool,
+    pub generate_generics_dump: bool,
+    pub dump_generics_rgctx: bool,
+    pub dump_generics_method_specs: bool,
+    pub dump_generics_custom_attributes: bool,
+    pub dump_generics_string_literals: bool,
+    pub dump_generics_metadata_usages: bool,
+    pub dump_generics_vtables: bool,
+    pub dump_generics_interfaces: bool,
+    pub dump_disassembly: bool,
+    pub dump_disassembly_hex_bytes: bool,
+    pub dump_disassembly_field_names: bool,
+    pub dump_disassembly_annotations: bool,
+    pub dump_disassembly_cfg: bool,
+    pub max_disassembly_instructions: usize,
 }
 
 impl Default for Config {
@@ -42,6 +56,20 @@ impl Default for Config {
             force_dump: false,
             no_redirected_pointer: false,
             split_dump_per_type: true,
+            generate_generics_dump: true,
+            dump_generics_rgctx: true,
+            dump_generics_method_specs: true,
+            dump_generics_custom_attributes: true,
+            dump_generics_string_literals: true,
+            dump_generics_metadata_usages: true,
+            dump_generics_vtables: true,
+            dump_generics_interfaces: true,
+            dump_disassembly: false,
+            dump_disassembly_hex_bytes: true,
+            dump_disassembly_field_names: true,
+            dump_disassembly_annotations: true,
+            dump_disassembly_cfg: true,
+            max_disassembly_instructions: 512,
         }
     }
 }

@@ -4,6 +4,7 @@ pub mod struct_generator;
 pub mod dummy_assembly_generator;
 pub mod header_constants;
 pub mod embedded_scripts;
+pub mod generics;
 
 pub use script_json::*;
 pub use decompiler::Il2CppDecompiler;
