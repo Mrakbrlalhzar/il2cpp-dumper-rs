@@ -7,8 +7,8 @@ license = "MIT"
 description = "A blazing fast and reliable il2cpp dumper cross platfrom."
 homepage = "https://github.com/rodroidmods/il2cpp-dumper-rs"
 repository = "https://github.com/rodroidmods/il2cpp-dumper-rs"
-keywords = ["il2cpp", "dumper", "android", "ios", "reverse-engineering"]
-categories = ["development-tools::debugging", "development-tools::decompilation"]
+keywords = ["il2cpp", "dumper", "android", "windows", "linux", "ios", "reverse-engineering"]
+categories = ["development-tools", "parsing", "security"]
 readme = "README.md"
 
 [[bin]]
