@@ -2,6 +2,14 @@
 name = "il2cpp_dumper"
 version = "0.4.0"
 edition = "2024"
+authors = ["Rodroidmods"]
+license = "MIT"
+description = "A blazing fast and reliable il2cpp dumper cross platfrom."
+homepage = "https://github.com/rodroidmods/il2cpp-dumper-rs"
+repository = "https://github.com/rodroidmods/il2cpp-dumper-rs"
+keywords = ["il2cpp", "dumper", "android", "ios", "reverse-engineering"]
+categories = ["development-tools::debugging", "development-tools::decompilation"]
+readme = "README.md"
 
 [[bin]]
 name = "il2cpp_dumper"

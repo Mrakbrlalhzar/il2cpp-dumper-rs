@@ -542,7 +542,6 @@ impl Elf {
     pub fn list_exported_symbols(&mut self) -> Result<Vec<(String, u64)>> {
         let mut exports = Vec::new();
         let mut seen = HashSet::new();
-        let sym_entry_size = if self.is_32bit { 16u64 } else { 24 };
 
         for sh_type in [SHT_DYNSYM, SHT_SYMTAB] {
             if let Some(idx) = self.sections.iter().position(|s| s.sh_type == sh_type) {
