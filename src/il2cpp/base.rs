@@ -52,6 +52,8 @@ pub struct Il2Cpp {
     pub unresolved_virtual_call_pointers: Vec<u64>,
     pub arch: Option<Architecture>,
     pub e_machine: u16,
+    pub exported_symbols: Vec<String>,
+    pub api_export_rvas: HashMap<String, u64>,
 }
 
 impl Il2Cpp {
@@ -90,6 +92,8 @@ impl Il2Cpp {
             unresolved_virtual_call_pointers: Vec::new(),
             arch: None,
             e_machine: 0,
+            exported_symbols: Vec::new(),
+            api_export_rvas: HashMap::new(),
         }
     }
 
@@ -144,6 +148,8 @@ impl Il2Cpp {
             unresolved_virtual_call_pointers: Vec::new(),
             arch: Architecture::from_elf_machine(elf.header.e_machine),
             e_machine: elf.header.e_machine,
+            exported_symbols: Vec::new(),
+            api_export_rvas: HashMap::new(),
         }
     }
 

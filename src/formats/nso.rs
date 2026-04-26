@@ -3,8 +3,8 @@ use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
 use crate::formats::elf::{
     ElfDyn, ElfSym,
-    DT_HASH, DT_GNU_HASH, DT_SYMTAB, DT_RELA, DT_RELASZ,
-    R_AARCH64_ABS64, R_AARCH64_RELATIVE,
+    DT_HASH, DT_GNU_HASH, DT_SYMTAB, DT_STRTAB, DT_RELA, DT_RELASZ,
+    R_AARCH64_ABS64, R_AARCH64_RELATIVE, SHN_UNDEF,
 };
 
 pub const NSO_MAGIC: u32 = 0x304F534E;
@@ -21,6 +21,8 @@ pub struct Nso {
     pub is_32bit: bool,
     segments: Vec<NsoSegment>,
     bss_segment: Option<NsoSegment>,
+    dynamic: Vec<ElfDyn>,
+    symbols: Vec<ElfSym>,
 }
 
 impl Nso {
@@ -52,6 +54,8 @@ impl Nso {
             is_32bit: false,
             segments,
             bss_segment: None,
+            dynamic: Vec::new(),
+            symbols: Vec::new(),
         };
 
         if !is_compressed {
@@ -92,6 +96,8 @@ impl Nso {
 
         let symbol_table = self.read_symbols(&dynamic_section)?;
         self.process_relocations(&dynamic_section, &symbol_table)?;
+        self.dynamic = dynamic_section;
+        self.symbols = symbol_table;
 
         Ok(())
     }
@@ -394,6 +400,29 @@ impl Nso {
 
     pub fn check_dump(&self) -> bool {
         false
+    }
+
+    pub fn list_exported_symbols(&mut self) -> Result<Vec<(String, u64)>> {
+        let mut exports = Vec::new();
+        let strtab_entry = self.dynamic.iter().find(|d| d.d_tag == DT_STRTAB);
+        let strtab_addr = match strtab_entry {
+            Some(e) => e.d_un,
+            None => return Ok(exports),
+        };
+        let strtab_offset = match self.map_vatr(strtab_addr) {
+            Ok(o) => o,
+            Err(_) => return Ok(exports),
+        };
+        for sym in self.symbols.clone() {
+            if sym.st_value == 0 || sym.st_shndx == SHN_UNDEF { continue; }
+            let name = match self.stream.read_string_to_null_at(strtab_offset + sym.st_name as u64) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if name.is_empty() { continue; }
+            exports.push((name, sym.st_value));
+        }
+        Ok(exports)
     }
 
     pub fn get_rva(&self, pointer: u64) -> u64 {

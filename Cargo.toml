@@ -1,6 +1,6 @@
 [package]
 name = "il2cpp_dumper"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [[bin]]
@@ -22,6 +22,7 @@ thiserror = "2"
 yaxpeax-arm = "0.4"
 yaxpeax-arch = "0.3"
 iced-x86 = "1.21"
+include_dir = "0.7.4"
 
 [dev-dependencies]
 pretty_assertions = "1"

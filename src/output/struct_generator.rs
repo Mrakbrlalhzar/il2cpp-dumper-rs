@@ -10,15 +10,22 @@ use crate::il2cpp::structures::*;
 use crate::executor::Il2CppExecutor;
 use super::script_json::*;
 use super::header_constants;
+use super::cpp_scaffolding::CppScaffolding;
+use super::name_mangler::MangledNameBuilder;
+use super::header_manager::UnityHeaders;
 
-static KEYWORDS: &[&str] = &[
-    "klass", "monitor", "register", "_cs", "auto", "friend", "template",
-    "flat", "default", "_ds", "interrupt", "unsigned", "signed", "asm",
-    "if", "case", "break", "continue", "do", "new", "_", "short",
-    "union", "class", "namespace",
+use crate::utils::{sanitize_cpp_identifier, NameSanitizerOptions};
+
+static C_PRIMITIVE_TYPES: &[&str] = &[
+    "void", "bool", "char", "int8_t", "uint8_t", "int16_t", "uint16_t",
+    "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double",
+    "intptr_t", "uintptr_t", "Il2CppChar",
 ];
 
-static SPECIAL_KEYWORDS: &[&str] = &["inline", "near", "far"];
+fn needs_struct_prefix(type_name: &str) -> bool {
+    let base = type_name.trim_end_matches('*');
+    !C_PRIMITIVE_TYPES.contains(&base)
+}
 
 struct StructFieldInfo {
     field_type_name: String,
@@ -66,26 +73,76 @@ impl StructGenerator {
         executor: &mut Il2CppExecutor,
         metadata: &mut Metadata,
         il2cpp: &mut Il2Cpp,
+        config: &crate::config::Config,
         output_dir: &str,
     ) -> Result<()> {
         let output_path = Path::new(output_dir);
 
-        let script_json = Self::build_script_json(executor, metadata, il2cpp)?;
+        let script_json = Self::build_script_json(executor, metadata, il2cpp, config)?;
         let string_literal_json = Self::build_string_literal_json(metadata)?;
-        let header = Self::build_header(executor, metadata, il2cpp)?;
+        let header = Self::build_header(executor, metadata, il2cpp, config)?;
+        let mut functions_header = String::new();
+        if config.generate_cpp_scaffold {
+            functions_header = CppScaffolding::build(executor, metadata, il2cpp).unwrap_or_default();
+        }
+
+        let mut unity_type_header = String::new();
+        let mut unity_api_header = String::new();
+        if config.generate_unity_headers {
+            let api_exports: HashSet<String> = il2cpp
+                .exported_symbols
+                .iter()
+                .filter(|n| n.starts_with("il2cpp_") || n.starts_with("mono_"))
+                .cloned()
+                .collect();
+            let metadata_version = il2cpp.version;
+            let field_offsets_are_pointers = false; // Could be improved by checking MetadataRegistration
+            let mut headers = UnityHeaders::guess_headers_for_binary(
+                metadata_version as f32,
+                il2cpp.is_32bit,
+                &api_exports,
+                field_offsets_are_pointers
+            );
+            
+            if let Some(h) = headers.pop() { // Use the best guessed headers
+                unity_type_header = h.get_type_header_text(il2cpp.is_32bit);
+                unity_api_header = h.get_api_header_text();
+            }
+        }
 
         use rayon::prelude::*;
-        let writes: Vec<(&str, &[u8])> = vec![
+        let mut writes: Vec<(&str, &[u8])> = vec![
             ("script.json", script_json.as_bytes()),
             ("stringliteral.json", string_literal_json.as_bytes()),
             ("il2cpp.h", header.as_bytes()),
         ];
+        if config.generate_cpp_scaffold {
+            writes.push(("il2cpp-functions.h", functions_header.as_bytes()));
+        }
+        if config.generate_unity_headers {
+            if !unity_type_header.is_empty() {
+                writes.push(("il2cpp-types.h", unity_type_header.as_bytes()));
+            }
+            if !unity_api_header.is_empty() {
+                writes.push(("il2cpp-api.h", unity_api_header.as_bytes()));
+            }
+        }
         writes.par_iter().for_each(|(name, data)| {
             let path = output_path.join(name);
             if let Err(e) = fs::write(&path, data) {
                 eprintln!("WARNING: Failed to write {name}: {e}");
             }
         });
+
+        if config.generate_cpp_scaffold && config.generate_unity_headers && !unity_type_header.is_empty() {
+            let project_root = output_path.join("cpp_project");
+            if let Err(e) = CppScaffolding::write_project(
+                executor, metadata, il2cpp,
+                &unity_type_header, &unity_api_header, &project_root,
+            ) {
+                eprintln!("WARNING: Failed to write cpp_project scaffolding: {e}");
+            }
+        }
 
         Ok(())
     }
@@ -94,6 +151,7 @@ impl StructGenerator {
         executor: &mut Il2CppExecutor,
         metadata: &mut Metadata,
         il2cpp: &mut Il2Cpp,
+        config: &crate::config::Config,
     ) -> Result<String> {
         let mut script = ScriptJson::new();
         let mut addresses_set: HashSet<u64> = HashSet::new();
@@ -121,15 +179,31 @@ impl StructGenerator {
                         let rva = il2cpp.get_rva(method_pointer);
                         addresses_set.insert(rva);
                         let method_full_name = format!("{}$${}", type_name, method_name_raw);
+                        let mangled_name = if config.mangle_names {
+                            MangledNameBuilder::mangle_method(
+                                executor, metadata, il2cpp, &type_def, type_def_index, &method_def,
+                            )
+                        } else {
+                            method_full_name.clone()
+                        };
+                        
+                        let (dotnet_sig, group) = if config.enhanced_ida_metadata {
+                            (Some(format!("{}::{}()", type_name, method_name_raw)),
+                             Some(format!("{}/{}", image_name.trim_end_matches(".dll"), type_name.replace('.', "/"))))
+                        } else {
+                            (None, None)
+                        };
                         let (signature, type_sig) = Self::build_method_signature(
                             executor, metadata, il2cpp, &method_def, &type_def,
                             &method_full_name, &struct_name_dic, None,
                         );
                         script.script_methods.push(ScriptMethod {
                             address: rva,
-                            name: method_full_name,
+                            name: mangled_name,
                             signature,
                             type_signature: type_sig,
+                            dotnet_signature: dotnet_sig,
+                            group,
                         });
                     }
 
@@ -148,6 +222,21 @@ impl StructGenerator {
                             let (class_inst, method_inst) = executor.get_method_spec_generic_context(*spec_idx, il2cpp);
                             let generic_context = Il2CppGenericContext { class_inst, method_inst };
 
+                            let mangled_name = if config.mangle_names {
+                                MangledNameBuilder::mangle_method_spec(
+                                    executor, metadata, il2cpp, &type_def, type_def_index, &method_def, &generic_context,
+                                )
+                            } else {
+                                method_full_name.clone()
+                            };
+                            
+                            let (dotnet_sig, group) = if config.enhanced_ida_metadata {
+                                (Some(format!("{}::{}()", spec_type_name, spec_method_name)),
+                                 Some(format!("{}/{}", image_name.trim_end_matches(".dll"), spec_type_name.replace('.', "/"))))
+                            } else {
+                                (None, None)
+                            };
+
                             let (signature, type_sig) = Self::build_method_signature(
                                 executor, metadata, il2cpp, &method_def, &type_def,
                                 &method_full_name, &struct_name_dic, Some(&generic_context),
@@ -155,9 +244,11 @@ impl StructGenerator {
 
                             script.script_methods.push(ScriptMethod {
                                 address: spec_rva,
-                                name: method_full_name,
+                                name: mangled_name,
                                 signature,
                                 type_signature: type_sig,
+                                dotnet_signature: dotnet_sig,
+                                group,
                             });
                         }
                     }
@@ -168,9 +259,9 @@ impl StructGenerator {
         Self::collect_all_addresses(&mut addresses_set, executor, il2cpp);
 
         if il2cpp.version >= 27.0 {
-            Self::scan_v27_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names);
+            Self::scan_v27_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names, config);
         } else if il2cpp.version > 16.0 {
-            Self::add_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names);
+            Self::add_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names, config);
         }
 
         let mut sorted_addresses: Vec<u64> = addresses_set.into_iter().filter(|a| *a > 0).collect();
@@ -249,14 +340,22 @@ impl StructGenerator {
         let is_static = (method_def.flags as u32 & method_attributes::STATIC) != 0;
         if !is_static {
             let byval_type = il2cpp.types[type_def.byval_type_index as usize].clone();
-            let this_type = Self::parse_type(
-                &il2cpp.types[type_def.byval_type_index as usize].clone(),
-                struct_name_dic, executor, metadata, il2cpp, generic_context, None,
-            );
             let te = Il2CppTypeEnum::from_u8(byval_type.type_enum)
                 .unwrap_or(Il2CppTypeEnum::Object);
             type_signature_parts.push(te);
-            param_strs.push(format!("{} __this", this_type));
+            if type_def.is_value_type() {
+                let klass_idx = byval_type.klass_index() as usize;
+                let base_name = struct_name_dic.get(&klass_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("Il2CppObject");
+                param_strs.push(format!("{}* __this", base_name));
+            } else {
+                let this_type = Self::parse_type(
+                    &byval_type,
+                    struct_name_dic, executor, metadata, il2cpp, generic_context, None,
+                );
+                param_strs.push(format!("{} __this", this_type));
+            }
         } else if il2cpp.version <= 24.0 {
             type_signature_parts.push(Il2CppTypeEnum::Ptr);
             param_strs.push("Il2CppObject* __this".to_string());
@@ -298,6 +397,14 @@ impl StructGenerator {
         let pointers = il2cpp.read_ptr_array(generic_inst.type_argv, generic_inst.type_argc).ok()?;
         let pointer = *pointers.get(param_num as usize)?;
         il2cpp.get_il2cpp_type(pointer).cloned()
+    }
+
+    pub fn resolve_generic_type_var_pub(
+        il2cpp: &mut Il2Cpp,
+        inst_addr: u64,
+        param_num: u32,
+    ) -> Option<Il2CppType> {
+        Self::resolve_generic_type_var(il2cpp, inst_addr, param_num)
     }
 
     fn parse_type(
@@ -460,6 +567,14 @@ impl StructGenerator {
         dic
     }
 
+    pub fn build_struct_name_dic_pub(
+        executor: &mut Il2CppExecutor,
+        metadata: &mut Metadata,
+        il2cpp: &mut Il2Cpp,
+    ) -> HashMap<usize, String> {
+        Self::build_struct_name_dic(executor, metadata, il2cpp)
+    }
+
     fn build_type_def_image_names(metadata: &mut Metadata) -> HashMap<usize, String> {
         let mut dic = HashMap::new();
         let image_defs = metadata.image_defs.clone();
@@ -473,6 +588,128 @@ impl StructGenerator {
         dic
     }
 
+    pub fn build_type_def_image_names_pub(metadata: &mut Metadata) -> HashMap<usize, String> {
+        Self::build_type_def_image_names(metadata)
+    }
+
+    fn classify_types_for_header(
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+        struct_name_dic: &HashMap<usize, String>,
+        generic_class_struct_name_dic: &HashMap<u64, String>,
+    ) -> crate::output::cpp_type_model::CppTypeGroupRegistry {
+        use crate::output::cpp_type_model::{CppTypeGroup, CppTypeGroupRegistry};
+        let mut registry = CppTypeGroupRegistry::new();
+
+        let resolve_type_to_name = |type_index: usize| -> Option<String> {
+            let t = il2cpp.types.get(type_index)?;
+            Self::resolve_il2cpp_type_name(t, il2cpp, struct_name_dic, generic_class_struct_name_dic)
+        };
+
+        let generic_method_defs: HashSet<usize> = il2cpp
+            .method_definition_method_specs
+            .keys()
+            .copied()
+            .collect();
+
+        for (method_index, method_def) in metadata.method_defs.iter().enumerate() {
+            let is_generic = method_def.generic_container_index >= 0
+                || generic_method_defs.contains(&method_index);
+            let group = if is_generic {
+                CppTypeGroup::TypesFromGenericMethods
+            } else {
+                CppTypeGroup::TypesFromMethods
+            };
+
+            if let Some(name) = resolve_type_to_name(method_def.return_type as usize) {
+                registry.assign(&name, group);
+            }
+            for j in 0..method_def.parameter_count as usize {
+                let p_idx = method_def.parameter_start as usize + j;
+                if let Some(param_def) = metadata.parameter_defs.get(p_idx) {
+                    if let Some(name) = resolve_type_to_name(param_def.type_index as usize) {
+                        if registry.group_of(&name) != Some(CppTypeGroup::TypesFromMethods) {
+                            registry.assign(&name, group);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (_, dic) in metadata.metadata_usage_dic.iter() {
+            for (_, encoded) in dic.iter() {
+                let shift = crate::il2cpp::enums::Il2CppMetadataUsage::encoded_index_shift(il2cpp.version);
+                let mask = (1u32 << shift) - 1;
+                let usage_tag = encoded & mask;
+                let idx = (encoded >> shift) as usize;
+                match usage_tag {
+                    1 => {
+                        if let Some(name) = struct_name_dic.get(&idx) {
+                            if registry.group_of(name).is_none() {
+                                registry.assign(name, CppTypeGroup::TypesFromUsages);
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(name) = resolve_type_to_name(idx) {
+                            if registry.group_of(&name).is_none() {
+                                registry.assign(&name, CppTypeGroup::TypesFromUsages);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for name in struct_name_dic.values() {
+            if registry.group_of(name).is_none() {
+                registry.assign(name, CppTypeGroup::UnusedConcreteTypes);
+            }
+        }
+        for name in generic_class_struct_name_dic.values() {
+            if registry.group_of(name).is_none() {
+                registry.assign(name, CppTypeGroup::UnusedConcreteTypes);
+            }
+        }
+
+        registry
+    }
+
+    fn resolve_il2cpp_type_name(
+        il2cpp_type: &Il2CppType,
+        il2cpp: &Il2Cpp,
+        struct_name_dic: &HashMap<usize, String>,
+        generic_class_struct_name_dic: &HashMap<u64, String>,
+    ) -> Option<String> {
+        let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum)?;
+        match te {
+            Il2CppTypeEnum::Class | Il2CppTypeEnum::ValueType => {
+                let klass_idx = il2cpp_type.klass_index() as usize;
+                struct_name_dic.get(&klass_idx).cloned()
+            }
+            Il2CppTypeEnum::GenericInst => {
+                let gc_ptr = il2cpp_type.generic_class();
+                if gc_ptr != 0 {
+                    if let Some(n) = generic_class_struct_name_dic.get(&gc_ptr) {
+                        return Some(n.clone());
+                    }
+                }
+                let klass_idx = il2cpp_type.klass_index() as usize;
+                struct_name_dic.get(&klass_idx).cloned()
+            }
+            Il2CppTypeEnum::Ptr | Il2CppTypeEnum::SzArray | Il2CppTypeEnum::Array => {
+                if il2cpp_type.datapoint != 0 {
+                    let inner = il2cpp.types.get(il2cpp_type.datapoint as usize)?;
+                    Self::resolve_il2cpp_type_name(inner, il2cpp, struct_name_dic, generic_class_struct_name_dic)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn add_metadata_usages(
         script: &mut ScriptJson,
         executor: &mut Il2CppExecutor,
@@ -480,6 +717,7 @@ impl StructGenerator {
         il2cpp: &mut Il2Cpp,
         struct_name_dic: &HashMap<usize, String>,
         _type_def_image_names: &HashMap<usize, String>,
+        config: &crate::config::Config,
     ) {
         if metadata.metadata_usage_dic.is_empty() { return; }
         let usage_dic = metadata.metadata_usage_dic.clone();
@@ -506,8 +744,16 @@ impl StructGenerator {
                             script.script_metadata.push(ScriptMetadata {
                                 address: rva,
                                 name: format!("{}_TypeInfo", type_name),
-                                signature: Some(sig),
+                                signature: Some(sig.clone()),
                             });
+                            if config.enhanced_ida_metadata {
+                                script.type_info_pointers.push(ScriptTypeInfo {
+                                    address: rva,
+                                    name: format!("{}_TypeInfo", fix_name(&type_name)),
+                                    type_str: sig,
+                                    dotnet_type: Some(type_name.clone()),
+                                });
+                            }
                         }
                     }
                     2 => {
@@ -519,6 +765,14 @@ impl StructGenerator {
                                 name: format!("{}_var", type_name),
                                 signature: Some("Il2CppType*".to_string()),
                             });
+                            if config.enhanced_ida_metadata {
+                                script.type_ref_pointers.push(ScriptTypeInfo {
+                                    address: rva,
+                                    name: format!("{}_TypeRef", fix_name(&type_name)),
+                                    type_str: "Il2CppType*".to_string(),
+                                    dotnet_type: Some(type_name.clone()),
+                                });
+                            }
                         }
                     }
                     3 => {
@@ -549,20 +803,33 @@ impl StructGenerator {
                                 let field_idx = td.field_start as usize + field_ref.field_index as usize;
                                 if let Some(fd) = metadata.field_defs.get(field_idx) {
                                     let field_name = metadata.get_string_from_index(fd.name_index).unwrap_or_default();
+                                    let label = format!("Field${}.{}", type_name, field_name);
                                     script.script_metadata.push(ScriptMetadata {
                                         address: rva,
-                                        name: format!("Field${}.{}", type_name, field_name),
+                                        name: label.clone(),
                                         signature: None,
                                     });
+                                    if config.enhanced_ida_metadata {
+                                        script.field_infos.push(ScriptFieldInfo {
+                                            address: rva,
+                                            name: fix_name(&format!("{}.{}_Field", type_name, field_name)),
+                                            value: format!("{}.{}", type_name, field_name),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                     5 => {
                         if let Ok(string_literal) = metadata.get_string_literal_from_index(src) {
+                            let safe_id: String = string_literal.chars()
+                                .take(32)
+                                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                                .collect();
                             script.script_strings.push(ScriptString {
                                 address: rva,
                                 value: string_literal,
+                                name: Some(format!("StringLiteral_{}", safe_id)),
                             });
                         }
                     }
@@ -595,6 +862,7 @@ impl StructGenerator {
         il2cpp: &mut Il2Cpp,
         struct_name_dic: &HashMap<usize, String>,
         type_def_image_names: &HashMap<usize, String>,
+        config: &crate::config::Config,
     ) {
         let pointer_size = if il2cpp.is_32bit { 4u64 } else { 8u64 };
         let data_sections = il2cpp.data_sections.clone();
@@ -642,8 +910,16 @@ impl StructGenerator {
                             script.script_metadata.push(ScriptMetadata {
                                 address: rva,
                                 name: format!("{}_TypeInfo", type_name),
-                                signature: Some(sig),
+                                signature: Some(sig.clone()),
                             });
+                            if config.enhanced_ida_metadata {
+                                script.type_info_pointers.push(ScriptTypeInfo {
+                                    address: rva,
+                                    name: format!("{}_TypeInfo", fix_name(&type_name)),
+                                    type_str: sig,
+                                    dotnet_type: Some(type_name.clone()),
+                                });
+                            }
                         }
                     }
                     2 => {
@@ -655,6 +931,14 @@ impl StructGenerator {
                                 name: format!("{}_var", type_name),
                                 signature: Some("Il2CppType*".to_string()),
                             });
+                            if config.enhanced_ida_metadata {
+                                script.type_ref_pointers.push(ScriptTypeInfo {
+                                    address: rva,
+                                    name: format!("{}_TypeRef", fix_name(&type_name)),
+                                    type_str: "Il2CppType*".to_string(),
+                                    dotnet_type: Some(type_name.clone()),
+                                });
+                            }
                         }
                     }
                     3 => {
@@ -691,15 +975,27 @@ impl StructGenerator {
                                         name: format!("Field${}.{}", type_name, field_name),
                                         signature: None,
                                     });
+                                    if config.enhanced_ida_metadata {
+                                        script.field_infos.push(ScriptFieldInfo {
+                                            address: rva,
+                                            name: fix_name(&format!("{}.{}_Field", type_name, field_name)),
+                                            value: format!("{}.{}", type_name, field_name),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                     5 => {
                         if let Ok(string_literal) = metadata.get_string_literal_from_index(decoded_index as usize) {
+                            let safe_id: String = string_literal.chars()
+                                .take(32)
+                                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                                .collect();
                             script.script_strings.push(ScriptString {
                                 address: rva,
                                 value: string_literal,
+                                name: Some(format!("StringLiteral_{}", safe_id)),
                             });
                         }
                     }
@@ -846,6 +1142,7 @@ impl StructGenerator {
         executor: &mut Il2CppExecutor,
         metadata: &mut Metadata,
         il2cpp: &mut Il2Cpp,
+        config: &crate::config::Config,
     ) -> Result<String> {
         let version = il2cpp.version;
         let version_header = match header_constants::get_version_header(version) {
@@ -989,17 +1286,74 @@ impl StructGenerator {
             generic_class_list.extend(new_ptrs);
         }
 
+        let type_group_registry = Self::classify_types_for_header(
+            metadata,
+            il2cpp,
+            &struct_name_dic,
+            &generic_class_struct_name_dic,
+        );
 
+        let header_struct = if config.use_topological_sort {
+            let type_decls: Vec<crate::output::cpp_ast::CppTypeDecl> = struct_info_list.iter().map(|info| {
+                crate::output::cpp_ast::CppTypeDecl {
+                    name: info.type_name.clone(),
+                    is_value_type: info.is_value_type,
+                    parent: info.parent.clone(),
+                    instance_fields: info.fields.iter().map(|f| crate::output::cpp_ast::CppField {
+                        type_name: f.field_type_name.clone(),
+                        field_name: f.field_name.clone(),
+                        is_value_type: f.is_value_type,
+                        is_custom_type: f.is_custom_type,
+                    }).collect(),
+                    static_fields: info.static_fields.iter().map(|f| crate::output::cpp_ast::CppField {
+                        type_name: f.field_type_name.clone(),
+                        field_name: f.field_name.clone(),
+                        is_value_type: f.is_value_type,
+                        is_custom_type: f.is_custom_type,
+                    }).collect(),
+                    vtable: info.vtable_methods.iter().map(|v| crate::output::cpp_ast::CppVTableEntry {
+                        method_name: v.as_ref().map(|m| m.method_name.clone()),
+                    }).collect(),
+                    rgctxs: info.rgctxs.iter().map(|r| crate::output::cpp_ast::CppRGCTXEntry {
+                        rgctx_type: r.rgctx_type,
+                        type_name: r.type_name.clone(),
+                        class_name: r.class_name.clone(),
+                        method_name: r.method_name.clone(),
+                    }).collect(),
+                }
+            }).collect();
 
-        let struct_info_by_name: HashMap<String, usize> = struct_info_list.iter().enumerate()
-            .map(|(i, info)| (format!("{}_o", info.type_name), i))
-            .collect();
+            let layout = crate::output::cpp_type_dependency_graph::CppCompilerLayout::from_str(&config.compiler_layout);
+            let mut emitter = crate::output::cpp_ast::CppHeaderEmitter::new(layout, il2cpp.is_32bit, il2cpp.is_pe);
+            match emitter.emit_all_with_groups(&type_decls, Some(&type_group_registry)) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("WARNING: {e}. Falling back to recursive emission order.");
+                    let struct_info_by_name: HashMap<String, usize> = struct_info_list.iter().enumerate()
+                        .map(|(i, info)| (format!("{}_o", info.type_name), i))
+                        .collect();
+                    let mut forward_declared: HashSet<String> = HashSet::new();
+                    let mut struct_cache: HashSet<usize> = HashSet::new();
+                    let mut legacy_buf = String::with_capacity(1 << 18);
+                    for i in 0..struct_info_list.len() {
+                        Self::recursion_struct_info(i, &struct_info_list, &struct_info_by_name, &mut struct_cache, &mut forward_declared, &mut legacy_buf, il2cpp.is_32bit, il2cpp.is_pe, &config.compiler_layout);
+                    }
+                    legacy_buf
+                }
+            }
+        } else {
+            let struct_info_by_name: HashMap<String, usize> = struct_info_list.iter().enumerate()
+                .map(|(i, info)| (format!("{}_o", info.type_name), i))
+                .collect();
 
-        let mut struct_cache: HashSet<usize> = HashSet::new();
-        let mut header_struct = String::with_capacity(1 << 18);
-        for i in 0..struct_info_list.len() {
-            Self::recursion_struct_info(i, &struct_info_list, &struct_info_by_name, &mut struct_cache, &mut header_struct, il2cpp.is_32bit, il2cpp.is_pe);
-        }
+            let mut forward_declared: HashSet<String> = HashSet::new();
+            let mut struct_cache: HashSet<usize> = HashSet::new();
+            let mut legacy_buf = String::with_capacity(1 << 18);
+            for i in 0..struct_info_list.len() {
+                Self::recursion_struct_info(i, &struct_info_list, &struct_info_by_name, &mut struct_cache, &mut forward_declared, &mut legacy_buf, il2cpp.is_32bit, il2cpp.is_pe, &config.compiler_layout);
+            }
+            legacy_buf
+        };
 
         let mut method_info_header = String::with_capacity(1 << 16);
 
@@ -1089,7 +1443,8 @@ impl StructGenerator {
     ) {
         if type_def.field_count == 0 { return; }
         let field_end = type_def.field_start as usize + type_def.field_count as usize;
-        let mut field_name_cache: HashSet<String> = HashSet::new();
+        let mut instance_field_name_cache: HashSet<String> = HashSet::new();
+        let mut static_field_name_cache: HashSet<String> = HashSet::new();
 
         for i in type_def.field_start as usize..field_end {
             let field_def = metadata.field_defs[i].clone();
@@ -1112,12 +1467,21 @@ impl StructGenerator {
 
             let field_type_name = Self::parse_type(&field_type, struct_name_dic, executor, metadata, il2cpp, context, hdr_ctx.as_deref_mut());
             let mut field_name = fix_name(&metadata.get_string_from_index(field_def.name_index).unwrap_or_else(|_| "field".to_string()));
-            if !field_name_cache.insert(field_name.clone()) {
-                field_name = format!("_{}_{}", i - type_def.field_start as usize, field_name);
+
+            let is_static = (field_type.attrs & field_attributes::STATIC) != 0;
+            let name_cache = if is_static { &mut static_field_name_cache } else { &mut instance_field_name_cache };
+            if !name_cache.insert(field_name.clone()) {
+                let mut suffix = 1u32;
+                let base = field_name.clone();
+                loop {
+                    field_name = format!("{}_{}", base, suffix);
+                    if name_cache.insert(field_name.clone()) { break; }
+                    suffix += 1;
+                }
             }
 
-            let is_vt = Self::is_value_type_check(&field_type, metadata, il2cpp, executor);
-            let is_ct = Self::is_custom_type_check(&field_type, metadata, il2cpp, executor);
+            let is_vt = Self::is_value_type_check(&field_type, metadata, il2cpp, executor, context);
+            let is_ct = Self::is_custom_type_check(&field_type, metadata, il2cpp, executor, context);
 
             let field_info = StructFieldInfo {
                 field_type_name,
@@ -1126,7 +1490,7 @@ impl StructGenerator {
                 is_custom_type: is_ct,
             };
 
-            if (field_type.attrs & field_attributes::STATIC) != 0 {
+            if is_static {
                 info.static_fields.push(field_info);
             } else {
                 info.fields.push(field_info);
@@ -1134,7 +1498,7 @@ impl StructGenerator {
         }
     }
 
-    fn is_value_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor) -> bool {
+    fn is_value_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
         match Il2CppTypeEnum::from_u8(il2cpp_type.type_enum) {
             Some(Il2CppTypeEnum::ValueType) => {
                 let klass_idx = il2cpp_type.klass_index() as usize;
@@ -1154,16 +1518,44 @@ impl StructGenerator {
                 }
                 false
             }
+            Some(Il2CppTypeEnum::Var) => {
+                if let Some(ctx) = context {
+                    let generic_param = executor.get_generic_parameter_from_type(il2cpp_type, metadata, il2cpp);
+                    if let Some(gp) = generic_param {
+                        if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
+                            return Self::is_value_type_check(&resolved, metadata, il2cpp, executor, None);
+                        }
+                    }
+                }
+                false
+            }
+            Some(Il2CppTypeEnum::MVar) => {
+                if let Some(ctx) = context {
+                    let generic_param = executor.get_generic_parameter_from_type(il2cpp_type, metadata, il2cpp);
+                    if let Some(gp) = generic_param {
+                        if ctx.method_inst == 0 && ctx.class_inst != 0 {
+                            if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
+                                return Self::is_value_type_check(&resolved, metadata, il2cpp, executor, None);
+                            }
+                        } else {
+                            if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.method_inst, gp.num as u32) {
+                                return Self::is_value_type_check(&resolved, metadata, il2cpp, executor, None);
+                            }
+                        }
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
 
-    fn is_custom_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor) -> bool {
+    fn is_custom_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
         match Il2CppTypeEnum::from_u8(il2cpp_type.type_enum) {
             Some(Il2CppTypeEnum::Ptr) => {
                 if il2cpp_type.datapoint != 0 {
                     if let Some(ori) = il2cpp.types.get(il2cpp_type.datapoint as usize).cloned() {
-                        return Self::is_custom_type_check(&ori, metadata, il2cpp, executor);
+                        return Self::is_custom_type_check(&ori, metadata, il2cpp, executor, context);
                     }
                 }
                 false
@@ -1175,7 +1567,7 @@ impl StructGenerator {
                 if let Some(td) = metadata.type_defs.get(klass_idx) {
                     if td.is_enum() {
                         if let Some(elem) = il2cpp.types.get(td.element_type_index as usize).cloned() {
-                            return Self::is_custom_type_check(&elem, metadata, il2cpp, executor);
+                            return Self::is_custom_type_check(&elem, metadata, il2cpp, executor, context);
                         }
                     }
                     return true;
@@ -1189,7 +1581,7 @@ impl StructGenerator {
                         if let Some((td, _)) = executor.get_generic_class_type_definition(&generic_class, metadata, il2cpp) {
                             if td.is_enum() {
                                 if let Some(elem) = il2cpp.types.get(td.element_type_index as usize).cloned() {
-                                    return Self::is_custom_type_check(&elem, metadata, il2cpp, executor);
+                                    return Self::is_custom_type_check(&elem, metadata, il2cpp, executor, context);
                                 }
                             }
                             return true;
@@ -1197,6 +1589,34 @@ impl StructGenerator {
                     }
                 }
                 true
+            }
+            Some(Il2CppTypeEnum::Var) => {
+                if let Some(ctx) = context {
+                    let generic_param = executor.get_generic_parameter_from_type(il2cpp_type, metadata, il2cpp);
+                    if let Some(gp) = generic_param {
+                        if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
+                            return Self::is_custom_type_check(&resolved, metadata, il2cpp, executor, None);
+                        }
+                    }
+                }
+                false
+            }
+            Some(Il2CppTypeEnum::MVar) => {
+                if let Some(ctx) = context {
+                    let generic_param = executor.get_generic_parameter_from_type(il2cpp_type, metadata, il2cpp);
+                    if let Some(gp) = generic_param {
+                        if ctx.method_inst == 0 && ctx.class_inst != 0 {
+                            if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.class_inst, gp.num as u32) {
+                                return Self::is_custom_type_check(&resolved, metadata, il2cpp, executor, None);
+                            }
+                        } else {
+                            if let Some(resolved) = Self::resolve_generic_type_var(il2cpp, ctx.method_inst, gp.num as u32) {
+                                return Self::is_custom_type_check(&resolved, metadata, il2cpp, executor, None);
+                            }
+                        }
+                    }
+                }
+                false
             }
             _ => false,
         }
@@ -1320,14 +1740,60 @@ impl StructGenerator {
         }
     }
 
+    fn write_gcc_parent_fields(
+        idx: usize,
+        list: &[StructInfo],
+        name_map: &HashMap<String, usize>,
+        buf: &mut String,
+    ) {
+        let info = &list[idx];
+        if let Some(parent_name) = &info.parent {
+            let parent_key = format!("{}_o", parent_name);
+            if let Some(&parent_idx) = name_map.get(&parent_key) {
+                // Recursively write fields from the topmost base class down
+                Self::write_gcc_parent_fields(parent_idx, list, name_map, buf);
+                
+                let p_info = &list[parent_idx];
+                for field in &p_info.fields {
+                    if field.is_custom_type && needs_struct_prefix(&field.field_type_name) {
+                        writeln!(buf, "\tstruct {} {};", field.field_type_name, field.field_name).ok();
+                    } else {
+                        writeln!(buf, "\t{} {};", field.field_type_name, field.field_name).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_value_type_defined(
+        field_type_name: &str,
+        list: &[StructInfo],
+        name_map: &HashMap<String, usize>,
+        cache: &mut HashSet<usize>,
+        forward_declared: &mut HashSet<String>,
+        buf: &mut String,
+        is_32bit: bool,
+        is_pe: bool,
+        compiler_layout: &str,
+    ) {
+        if let Some(&field_idx) = name_map.get(field_type_name) {
+            Self::recursion_struct_info(field_idx, list, name_map, cache, forward_declared, buf, is_32bit, is_pe, compiler_layout);
+        } else if forward_declared.insert(field_type_name.to_string()) {
+            writeln!(buf, "struct {} {{", field_type_name).ok();
+            writeln!(buf, "\tuint8_t _stub;").ok();
+            writeln!(buf, "}};").ok();
+        }
+    }
     fn recursion_struct_info(
         idx: usize,
         list: &[StructInfo],
         name_map: &HashMap<String, usize>,
         cache: &mut HashSet<usize>,
+        forward_declared: &mut HashSet<String>,
         buf: &mut String,
         is_32bit: bool,
         is_pe: bool,
+        compiler_layout: &str,
     ) {
         if !cache.insert(idx) { return; }
         let info = &list[idx];
@@ -1335,29 +1801,45 @@ impl StructGenerator {
         if let Some(parent_name) = &info.parent {
             let parent_key = format!("{}_o", parent_name);
             if let Some(&parent_idx) = name_map.get(&parent_key) {
-                Self::recursion_struct_info(parent_idx, list, name_map, cache, buf, is_32bit, is_pe);
-            }
-            writeln!(buf, "struct {}_Fields : {}_Fields {{", info.type_name, parent_name).ok();
-        } else {
-            if is_pe && !info.is_value_type {
-                if is_32bit {
-                    writeln!(buf, "struct __declspec(align(4)) {}_Fields {{", info.type_name).ok();
-                } else {
-                    writeln!(buf, "struct __declspec(align(8)) {}_Fields {{", info.type_name).ok();
-                }
-            } else {
-                writeln!(buf, "struct {}_Fields {{", info.type_name).ok();
+                Self::recursion_struct_info(parent_idx, list, name_map, cache, forward_declared, buf, is_32bit, is_pe, compiler_layout);
             }
         }
 
         for field in &info.fields {
+            if field.is_value_type { // ONLY hard-value dependencies, fixes topological cycle loops
+                Self::ensure_value_type_defined(&field.field_type_name, list, name_map, cache, forward_declared, buf, is_32bit, is_pe, compiler_layout);
+            }
+        }
+        for field in &info.static_fields {
             if field.is_value_type {
-                let field_key = &field.field_type_name;
-                if let Some(&field_idx) = name_map.get(field_key) {
-                    Self::recursion_struct_info(field_idx, list, name_map, cache, buf, is_32bit, is_pe);
+                Self::ensure_value_type_defined(&field.field_type_name, list, name_map, cache, forward_declared, buf, is_32bit, is_pe, compiler_layout);
+            }
+        }
+
+        if compiler_layout == "GCC" {
+            if is_pe && !info.is_value_type {
+                if is_32bit { writeln!(buf, "struct __declspec(align(4)) {}_Fields {{", info.type_name).ok(); } 
+                else { writeln!(buf, "struct __declspec(align(8)) {}_Fields {{", info.type_name).ok(); }
+            } else {
+                writeln!(buf, "struct {}_Fields {{", info.type_name).ok();
+            }
+            // Flatten fields from parents first
+            Self::write_gcc_parent_fields(idx, list, name_map, buf);
+        } else {
+            if let Some(parent_name) = &info.parent {
+                writeln!(buf, "struct {}_Fields : {}_Fields {{", info.type_name, parent_name).ok();
+            } else {
+                if is_pe && !info.is_value_type {
+                    if is_32bit { writeln!(buf, "struct __declspec(align(4)) {}_Fields {{", info.type_name).ok(); } 
+                    else { writeln!(buf, "struct __declspec(align(8)) {}_Fields {{", info.type_name).ok(); }
+                } else {
+                    writeln!(buf, "struct {}_Fields {{", info.type_name).ok();
                 }
             }
-            if field.is_custom_type {
+        }
+
+        for field in &info.fields {
+            if field.is_custom_type && needs_struct_prefix(&field.field_type_name) {
                 writeln!(buf, "\tstruct {} {};", field.field_type_name, field.field_name).ok();
             } else {
                 writeln!(buf, "\t{} {};", field.field_type_name, field.field_name).ok();
@@ -1401,6 +1883,7 @@ impl StructGenerator {
             writeln!(buf, "}};").ok();
         }
 
+
         writeln!(buf, "struct {}_c {{", info.type_name).ok();
         writeln!(buf, "\tIl2CppClass_1 _1;").ok();
         if !info.static_fields.is_empty() {
@@ -1432,13 +1915,7 @@ impl StructGenerator {
         if !info.static_fields.is_empty() {
             writeln!(buf, "struct {}_StaticFields {{", info.type_name).ok();
             for field in &info.static_fields {
-                if field.is_value_type {
-                    let field_key = &field.field_type_name;
-                    if let Some(&field_idx) = name_map.get(field_key) {
-                        Self::recursion_struct_info(field_idx, list, name_map, cache, buf, is_32bit, is_pe);
-                    }
-                }
-                if field.is_custom_type {
+                if field.is_custom_type && needs_struct_prefix(&field.field_type_name) {
                     writeln!(buf, "\tstruct {} {};", field.field_type_name, field.field_name).ok();
                 } else {
                     writeln!(buf, "\t{} {};", field.field_type_name, field.field_name).ok();
@@ -1579,29 +2056,10 @@ impl StructGenerator {
 }
 
 fn fix_name(name: &str) -> String {
-    if KEYWORDS.contains(&name) {
-        return format!("_{}", name);
-    }
-    if SPECIAL_KEYWORDS.contains(&name) {
-        return format!("_{}_", name);
-    }
-
-    let first_char = name.chars().next();
-    let starts_with_digit = first_char.map(|c| c.is_ascii_digit()).unwrap_or(false);
-
-    if starts_with_digit {
-        return format!("_{}", name);
-    }
-
-    let mut result = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            result.push(c);
-        } else {
-            result.push('_');
-        }
-    }
-    result
+    sanitize_cpp_identifier(name, NameSanitizerOptions {
+        allow_dollar: false,
+        avoid_double_underscore_prefix: true,
+    })
 }
 
 fn get_unique_name(name: &str, set: &mut HashSet<String>) -> String {

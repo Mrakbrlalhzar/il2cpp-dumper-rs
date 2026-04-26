@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
 </p>
 
-<h1 align="center">🛡️ Rodroid Il2CppDumper</h1>
+<h1 align="center">🛡️ Rodroid Il2CppDumper V4</h1>
 
 <p align="center">
   <b>A blazing-fast, cross-platform IL2CPP binary dumper written in Rust.</b><br/>
@@ -46,7 +46,15 @@
 | **Auto-numbered output dirs** | ❌ No | ❌ No | ✅ **Dump0/, Dump1/...** |
 | **Modern CLI UI (spinners, colors, prompts)** | ❌ No | ❌ No | ✅ **Yes** |
 | **Cross-platform binary** | ⚠️ Needs Python | ⚠️ Needs .NET | ✅ **Standalone** |
-| **GUI** | ❌ No | ✅ WinForms | ✅ **Jetpack Compose (Android)** |
+| **C++ Scaffold (il2cpp-functions.h)** | ❌ No | ❌ No | ✅ **Yes** |
+| **C++ Name Mangling (Itanium ABI)** | ❌ No | ❌ No | ✅ **Yes** |
+| **Unity Header Auto-Detection** | ❌ No | ✅ Yes | ✅ **Yes (version-matched)** |
+| **cpp_project/ Scaffolding** | ❌ No | ✅ Yes | ✅ **Yes** |
+| **Topological Sort (type ordering)** | ❌ No | ❌ No | ✅ **Yes** |
+| **Type Group Classification** | ❌ No | ❌ No | ✅ **Yes** |
+| **Enhanced IDA Metadata** | ❌ No | ❌ No | ✅ **Yes** |
+| **ELF Section Header Symbol Fallback** | ❌ No | ✅ Yes | ✅ **Yes** |
+| **GUI** | ❌ No | ✅ WinForms | ✅ **Jetpack Compose + Tauri** |
 | **Embeddable as library** | ❌ No | ❌ No | ✅ **Rust crate / JNI** |
 
 ### ⚡ Performance
@@ -72,9 +80,19 @@
 - **Inline Disassembly** — Optional per-method native assembly embedded directly in dump.cs
 - **DiffableCs** — Splits classes into individual `.cs` files by namespace, parallelized with `rayon`
 - **script.json** — Method addresses/signatures for IDA/Ghidra scripting
-- **il2cpp.h** — C struct definitions for native analysis
+- **il2cpp.h** — C struct definitions for native analysis with topological type ordering
 - **stringliteral.json** — All string literal values and indices
 - **DummyDLL** — Reconstructed .NET assemblies for dnSpy/ILSpy (parallelized)
+
+### C++ Headers & Scaffolding
+- **il2cpp-functions.h** — C++ scaffold with function pointer typedefs for hooking
+- **Itanium ABI Name Mangling** — Correct C++ mangled names for all IL2CPP types
+- **Unity Header Auto-Detection** — Version-matched `il2cpp-types.h` and `il2cpp-api.h` from embedded header database
+- **cpp_project/** — Ready-to-compile C++ project scaffold with includes and CMake structure
+- **Topological Sort** — Types emitted in dependency order; circular dependencies detected with fallback
+- **Type Group Classification** — Types categorized into forward declarations, method types, generic types, usage types
+- **Compiler Layout** — GCC (`__attribute__`) or MSVC (`__declspec`) layout attributes
+- **Enhanced IDA Metadata** — Extra type info annotations for IDA Pro scripts
 
 ### Disassembly Engine
 - **Multi-Architecture** — ARM64 (`yaxpeax-arm`), ARM32, x86/x64 (`iced-x86`)
@@ -154,7 +172,7 @@ il2cpp_dumper UnityFramework global-metadata.dat
     ╦╦  ╔═╗╔═╗╔═╗  ╔╦╗╦ ╦╔╦╗╔═╗╔═╗╦═╗
     ║║  ╠═╝║  ╠═╝   ║║║ ║║║║╠═╝║╣ ╠╦╝
     ╩╩═╝╚  ╚═╝╩    ═╩╝╚═╝╩ ╩╩  ╚═╝╩╚═
-    Version v0.3.0
+    Version v0.4.0
   ─────────────────────────────────────
 
   📂 Output .\Dump0
@@ -211,7 +229,13 @@ Create a `config.json` in the working directory (or use `--config`):
   "dumpDisassemblyFieldNames": true,
   "dumpDisassemblyAnnotations": true,
   "dumpDisassemblyCfg": true,
-  "maxDisassemblyInstructions": 512
+  "maxDisassemblyInstructions": 512,
+  "generateCppScaffold": true,
+  "mangleNames": true,
+  "enhancedIdaMetadata": true,
+  "generateUnityHeaders": true,
+  "compilerLayout": "GCC",
+  "useTopologicalSort": true
 }
 ```
 
@@ -242,8 +266,15 @@ il2cpp_dumper/src/
 │   └── x86.rs                        # x86/x64 decoder (iced-x86)
 └── output/                           # Output generators
     ├── decompiler.rs                 # dump.cs + inline disassembly
-    ├── struct_generator.rs           # script.json, il2cpp.h
-    └── dummy_assembly_generator.rs   # DummyDLL (parallel)
+    ├── struct_generator.rs           # script.json, il2cpp.h, type classification
+    ├── dummy_assembly_generator.rs   # DummyDLL (parallel)
+    ├── cpp_scaffolding.rs            # il2cpp-functions.h generation
+    ├── cpp_ast.rs                    # C++ AST emission with group annotations
+    ├── cpp_type_model.rs             # C++ type model from IL2CPP types
+    ├── cpp_type_dependency_graph.rs  # Topological sort + cycle detection
+    ├── name_mangler.rs               # Itanium ABI C++ name mangling
+    ├── header_manager.rs             # Unity header version matching
+    └── unity_version.rs              # Unity version parsing & ranges
 ```
 
 ---
@@ -259,6 +290,7 @@ MIT
 - [Perfare/Il2CppDumper](https://github.com/Perfare/Il2CppDumper) — Original C# implementation
 - [SamboyCoding/Cpp2IL](https://github.com/SamboyCoding/Cpp2IL) — Advanced C# IL2CPP analysis tool
 - [springmusk026/Il2CppDumper-Python](https://github.com/springmusk026/Il2CppDumper-Python) — Python port
+- [LukeFZ/Il2CppInspectorRedux](https://github.com/LukeFZ/Il2CppInspectorRedux) — Thanks for the code i used in v4 of my il2cppdumper, but its more faster since the logic its on rust and not C#
 - [dotnetdll](https://crates.io/crates/dotnetdll) — .NET DLL generation crate
 - [rayon](https://crates.io/crates/rayon) — Parallel processing
 - [console-rs](https://github.com/console-rs) — Terminal styling ecosystem (`console`, `indicatif`, `dialoguer`)

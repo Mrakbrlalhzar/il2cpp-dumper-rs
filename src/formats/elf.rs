@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::io::BinaryStream;
 use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
@@ -17,6 +17,7 @@ pub const DT_PLTGOT: i64 = 3;
 pub const DT_HASH: i64 = 4;
 pub const DT_STRTAB: i64 = 5;
 pub const DT_SYMTAB: i64 = 6;
+pub const DT_STRSZ: i64 = 10;
 pub const DT_RELA: i64 = 7;
 pub const DT_RELASZ: i64 = 8;
 pub const DT_INIT: i64 = 12;
@@ -36,6 +37,10 @@ pub const R_AARCH64_RELATIVE: u32 = 1027;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_RELATIVE: u32 = 8;
 
+pub const SHT_SYMTAB: u32 = 2;
+pub const SHT_STRTAB: u32 = 3;
+pub const SHT_DYNSYM: u32 = 11;
+pub const SHN_UNDEF: u16 = 0;
 pub const SHT_LOUSER: u32 = 0x80000000;
 
 #[derive(Debug, Clone, Default)]
@@ -363,6 +368,22 @@ impl Elf {
             return Ok(count as usize);
         }
 
+        if let Some(symtab_entry) = self.find_dynamic_entry(DT_SYMTAB) {
+            let symtab_addr = symtab_entry.d_un;
+            let sym_entry_size = if self.is_32bit { 16u64 } else { 24 };
+            if let Some(next_addr) = self.dynamic.iter()
+                .filter(|e| e.d_un > symtab_addr && e.d_tag != DT_NULL)
+                .map(|e| e.d_un)
+                .min()
+            {
+                let table_size = next_addr.saturating_sub(symtab_addr);
+                let count = table_size / sym_entry_size;
+                if count > 0 {
+                    return Ok(count as usize);
+                }
+            }
+        }
+
         Ok(0)
     }
 
@@ -516,6 +537,76 @@ impl Elf {
     pub fn map_vatr_u32_array(&mut self, addr: u64, count: u64) -> Result<Vec<u32>> {
         let offset = self.map_vatr(addr)?;
         self.stream.read_u32_array(offset, count as usize)
+    }
+
+    pub fn list_exported_symbols(&mut self) -> Result<Vec<(String, u64)>> {
+        let mut exports = Vec::new();
+        let mut seen = HashSet::new();
+        let sym_entry_size = if self.is_32bit { 16u64 } else { 24 };
+
+        for sh_type in [SHT_DYNSYM, SHT_SYMTAB] {
+            if let Some(idx) = self.sections.iter().position(|s| s.sh_type == sh_type) {
+                let sec = self.sections[idx].clone();
+                if sec.sh_entsize == 0 || sec.sh_size == 0 { continue; }
+                let count = sec.sh_size / sec.sh_entsize;
+                let strtab_idx = sec.sh_link as usize;
+                if strtab_idx >= self.sections.len() { continue; }
+                let strtab_offset = self.sections[strtab_idx].sh_offset;
+
+                self.stream.set_position(sec.sh_offset);
+                for _ in 0..count {
+                    let sym = if self.is_32bit {
+                        let st_name = self.stream.read_u32()?;
+                        let st_value = self.stream.read_u32()? as u64;
+                        let _st_size = self.stream.read_u32()?;
+                        let _st_info = self.stream.read_u8()?;
+                        let _st_other = self.stream.read_u8()?;
+                        let st_shndx = self.stream.read_u16()?;
+                        (st_name, st_value, st_shndx)
+                    } else {
+                        let st_name = self.stream.read_u32()?;
+                        let _st_info = self.stream.read_u8()?;
+                        let _st_other = self.stream.read_u8()?;
+                        let st_shndx = self.stream.read_u16()?;
+                        let st_value = self.stream.read_u64()?;
+                        let _st_size = self.stream.read_u64()?;
+                        (st_name, st_value, st_shndx)
+                    };
+                    if sym.1 == 0 || sym.2 == SHN_UNDEF { continue; }
+                    let name = match self.stream.read_string_to_null_at(strtab_offset + sym.0 as u64) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if name.is_empty() || seen.contains(&name) { continue; }
+                    seen.insert(name.clone());
+                    exports.push((name, sym.1));
+                }
+            }
+        }
+
+        if exports.is_empty() {
+            let strtab_un = match self.find_dynamic_entry(DT_STRTAB) {
+                Some(e) => e.d_un,
+                None => return Ok(exports),
+            };
+            let dynstr_offset = match self.map_vatr(strtab_un) {
+                Ok(o) => o,
+                Err(_) => return Ok(exports),
+            };
+            let syms = self.symbols.clone();
+            for sym in &syms {
+                if sym.st_value == 0 || sym.st_shndx == SHN_UNDEF { continue; }
+                let name = match self.stream.read_string_to_null_at(dynstr_offset + sym.st_name as u64) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if name.is_empty() || seen.contains(&name) { continue; }
+                seen.insert(name.clone());
+                exports.push((name, sym.st_value));
+            }
+        }
+
+        Ok(exports)
     }
 
     pub fn symbol_search(&mut self) -> Result<Option<(u64, u64)>> {

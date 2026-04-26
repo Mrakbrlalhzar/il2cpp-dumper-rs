@@ -391,6 +391,18 @@ impl MachO {
         }
     }
 
+    pub fn list_exported_symbols(&self) -> Vec<(String, u64)> {
+        let mut exports = Vec::new();
+        for sym in &self.symbols {
+            if sym.n_value == 0 || sym.n_sect == 0 { continue; }
+            let name = self.get_symbol_name(sym);
+            if name.is_empty() { continue; }
+            let name = if name.starts_with('_') { name[1..].to_string() } else { name };
+            exports.push((name, sym.n_value));
+        }
+        exports
+    }
+
     pub fn search_mod_init_func(&mut self, version: f64) -> Option<(u64, u64)> {
         let mod_init = self.sections.iter()
             .find(|s| s.sectname == "__mod_init_func")?

@@ -431,7 +431,16 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
         elf.init(cr, mr)?;
     }
 
-    Ok(Il2Cpp::from_elf(&elf))
+    let elf_exports = elf.list_exported_symbols().unwrap_or_default();
+    let mut il2cpp = Il2Cpp::from_elf(&elf);
+    il2cpp.exported_symbols = elf_exports.iter().map(|(n, _)| n.clone()).collect();
+    for (name, addr) in elf_exports {
+        if name.starts_with("il2cpp_") || name.starts_with("mono_") {
+            let rva = il2cpp.get_rva(addr);
+            il2cpp.api_export_rvas.insert(name, rva);
+        }
+    }
+    Ok(il2cpp)
 }
 
 fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
@@ -512,6 +521,14 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
         il2cpp_dumper::disassembler::Architecture::X64
     });
     il2cpp.init(cr_addr, mr_addr, &|addr| pe.map_vatr(addr))?;
+    if let Ok(exports) = pe.list_exported_symbols() {
+        il2cpp.exported_symbols = exports.iter().map(|(n, _)| n.clone()).collect();
+        for (name, rva) in exports {
+            if name.starts_with("il2cpp_") || name.starts_with("mono_") {
+                il2cpp.api_export_rvas.insert(name, rva);
+            }
+        }
+    }
     Ok(il2cpp)
 }
 
@@ -632,13 +649,22 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
         }
     }
 
+    let macho_exports = macho.list_exported_symbols();
+    il2cpp.exported_symbols = macho_exports.iter().map(|(n, _)| n.clone()).collect();
+    for (name, addr) in macho_exports {
+        if name.starts_with("il2cpp_") || name.starts_with("mono_") {
+            let rva = il2cpp.get_rva(addr);
+            il2cpp.api_export_rvas.insert(name, rva);
+        }
+    }
+
     Ok(il2cpp)
 }
 
 fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
     print_detection("NSO (Nintendo Switch) format");
 
-    let nso = Nso::new(data)?;
+    let mut nso = Nso::new(data)?;
 
     let version = if config.force_il2cpp_version {
         config.force_version
@@ -671,6 +697,17 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     let mut il2cpp = Il2Cpp::new(nso.stream.clone(), version, nso.is_32bit);
     il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
     il2cpp.init(cr_addr, mr_addr, &|addr| nso.map_vatr(addr))?;
+
+    if let Ok(nso_exports) = nso.list_exported_symbols() {
+        il2cpp.exported_symbols = nso_exports.iter().map(|(n, _)| n.clone()).collect();
+        for (name, addr) in nso_exports {
+            if name.starts_with("il2cpp_") || name.starts_with("mono_") {
+                let rva = il2cpp.get_rva(addr);
+                il2cpp.api_export_rvas.insert(name, rva);
+            }
+        }
+    }
+
     Ok(il2cpp)
 }
 
@@ -891,11 +928,11 @@ fn run() -> Result<()> {
 
     if config.generate_struct {
         let sp = spinner("Generating structs...");
-        StructGenerator::write_all(&mut executor, &mut metadata, &mut il2cpp, &output_dir)?;
+        StructGenerator::write_all(&mut executor, &mut metadata, &mut il2cpp, &config, &output_dir)?;
         il2cpp_dumper::output::embedded_scripts::write_scripts(std::path::Path::new(&output_dir))?;
         sp.finish_and_clear();
-        print_success("script.json, il2cpp.h, stringliteral.json generated");
-        generated_files.extend(["script.json".into(), "il2cpp.h".into(), "stringliteral.json".into()]);
+        print_success("script.json, il2cpp.h, il2cpp-functions.h, stringliteral.json generated");
+        generated_files.extend(["script.json".into(), "il2cpp.h".into(), "il2cpp-functions.h".into(), "stringliteral.json".into()]);
     }
 
     if config.generate_dummy_dll {

@@ -314,20 +314,33 @@ impl Disassembler {
             if show_annotations {
                 if let Some(target) = insn.call_target {
                     if let Some(name) = self.rva_to_name.get(&target) {
-                        buf.push_str(&format!("  // -> {name}"));
+                        buf.push_str(&format!("  // CALL → {name}"));
                         annotated = true;
                     } else if let Some(ann) = self.global_annotations.get(&target) {
-                        buf.push_str(&format!("  // -> {}", ann.label));
+                        buf.push_str(&format!("  // CALL → {}", ann.label));
+                        annotated = true;
+                    } else {
+                        buf.push_str(&format!("  // CALL → sub_{:X}", target));
                         annotated = true;
                     }
                 }
             }
 
             if !annotated && insn.is_branch && !insn.is_call && !insn.is_return {
-                if let Some(ref cfg) = cfg {
-                    if let Some(edge_label) = cfg.edge_labels.get(&insn.address) {
-                        buf.push_str(&format!("  // {}", edge_label));
-                        annotated = true;
+                if let Some(target) = insn.branch_target {
+                    if insn.is_unconditional_branch {
+                        if let Some(name) = self.rva_to_name.get(&target) {
+                            buf.push_str(&format!("  // TAIL CALL → {name}"));
+                            annotated = true;
+                        }
+                    }
+                }
+                if !annotated {
+                    if let Some(ref cfg) = cfg {
+                        if let Some(edge_label) = cfg.edge_labels.get(&insn.address) {
+                            buf.push_str(&format!("  // {}", edge_label));
+                            annotated = true;
+                        }
                     }
                 }
             }

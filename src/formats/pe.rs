@@ -165,6 +165,51 @@ impl Pe {
         0
     }
 
+    pub fn list_exported_symbols(&mut self) -> Result<Vec<(String, u64)>> {
+        let mut exports = Vec::new();
+        if self.data_directories.len() <= IMAGE_DIRECTORY_ENTRY_EXPORT {
+            return Ok(exports);
+        }
+        let export_dir = &self.data_directories[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if export_dir.virtual_address == 0 {
+            return Ok(exports);
+        }
+        let export_offset = self.map_vatr(export_dir.virtual_address as u64)?;
+        self.stream.set_position(export_offset);
+        let _characteristics = self.stream.read_u32()?;
+        let _time_date_stamp = self.stream.read_u32()?;
+        let _major_version = self.stream.read_u16()?;
+        let _minor_version = self.stream.read_u16()?;
+        let _name_rva = self.stream.read_u32()?;
+        let _base = self.stream.read_u32()?;
+        let _number_of_functions = self.stream.read_u32()?;
+        let number_of_names = self.stream.read_u32()?;
+        let address_of_functions = self.stream.read_u32()?;
+        let address_of_names = self.stream.read_u32()?;
+        let address_of_name_ordinals = self.stream.read_u32()?;
+        let names_offset = self.map_vatr(address_of_names as u64)?;
+        let ordinals_offset = self.map_vatr(address_of_name_ordinals as u64)?;
+        let functions_offset = self.map_vatr(address_of_functions as u64)?;
+        for i in 0..number_of_names {
+            self.stream.set_position(names_offset + i as u64 * 4);
+            let name_rva = self.stream.read_u32()?;
+            let name_offset = match self.map_vatr(name_rva as u64) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let name = match self.stream.read_string_to_null_at(name_offset) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            self.stream.set_position(ordinals_offset + i as u64 * 2);
+            let ordinal = self.stream.read_u16()?;
+            self.stream.set_position(functions_offset + ordinal as u64 * 4);
+            let func_rva = self.stream.read_u32()?;
+            exports.push((name, func_rva as u64));
+        }
+        Ok(exports)
+    }
+
     pub fn symbol_search(&mut self) -> Result<Option<(u64, u64)>> {
         if self.data_directories.len() <= IMAGE_DIRECTORY_ENTRY_EXPORT {
             return Ok(None);

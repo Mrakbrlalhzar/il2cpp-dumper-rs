@@ -24,11 +24,17 @@
   "dumpGenericsMetadataUsages": true,
   "dumpGenericsVtables": true,
   "dumpGenericsInterfaces": true,
-  "dumpDisassembly": true,
+  "dumpDisassembly": false,
   "dumpDisassemblyTarget": 0,
   "dumpDisassemblyHexBytes": true,
   "dumpDisassemblyFieldNames": true,
   "dumpDisassemblyAnnotations": true,
   "dumpDisassemblyCfg": true,
-  "maxDisassemblyInstructions": 512
+  "maxDisassemblyInstructions": 512,
+  "generateCppScaffold": true,
+  "mangleNames": true,
+  "enhancedIdaMetadata": true,
+  "generateUnityHeaders": true,
+  "compilerLayout": "GCC",
+  "useTopologicalSort": true
 }
