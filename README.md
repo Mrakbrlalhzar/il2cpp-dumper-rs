@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
 </p>
 
-<h1 align="center">🛡️ Rodroid Il2CppDumper V5</h1>
+<h1 align="center">🛡️ Rodroid Il2CppDumper V6</h1>
 
 <p align="center">
   <b>A blazing-fast, cross-platform IL2CPP binary dumper written in Rust.</b><br/>
@@ -148,6 +148,29 @@
 - ~95 % of encrypted Il2CppType entries recovered (class names, value types, generic instances, field type references). The remaining ~5 % are **intentional decoy fields** with the `LITERAL` (0x40) attribute flag set on real instance fields — same limitation as the C# CODM dumper; not an encryption gap.
 - Toggle via `--codm` flag or `Codm: true` in config — additive code path, leaves standard Unity games untouched
 
+### What's new in v6
+
+#### Static metadata & thread-static
+- 🧵 **Thread-static field support** — TLS offset decode (`0x80000000` flag), comment annotations in dump.cs, DummyDll `ThreadStaticAttribute`
+- 📦 **FieldRVA / PrivateImplementationDetails** — optional `static_metadata.json`, optional blob export, `FieldRvaAttribute` in DummyDll
+- 🍎 **iOS CODM auto-detection** — `resolve_codm()` when metadata variant is CODM (same as Android ELF path)
+- 🔍 **Unity 27+ FieldRva metadata usage (case 7)** — `script.json` `FieldRvas` on PE / Mach-O / NSO / WASM via `data_sections` scan
+- 📐 **`Il2CppTypeDefinitionSizes` loading** — thread-static block heuristics from `MetadataRegistration` on all formats
+- 🛠️ **Memory-dumped CODM fixes** — improved dump-file / image-base handling so memory-captured CODM binaries (Android ELF + iOS Mach-O) init and decrypt types reliably alongside standard dump support
+- ⚙️ **Configurable static metadata** — `dumpStaticFieldMetadata` master toggle (off by default for speed); nested `dumpFieldRvaData` (off by default — blobs make JSON huge) + `maxFieldRvaDumpBytes`
+- 🖥️ **GUI parity** — Jetpack Compose + Tauri desktop apps ship the same v6 engine and config keys
+
+#### Disassembler cross-platform parity
+Full ARM32 + x86/x64 annotation parity with ARM64 (see [`DISASSEMBLER_UPGRADE.md`](DISASSEMBLER_UPGRADE.md)):
+- **ARM32 rewrite** — propagation engine now runs on 32-bit Android: `ConstantOp`, `LoadInfo`, `RegRegAccess`, `IndirectCallReg`, CBZ/CBNZ, ADR/ADRL, LDM block loads
+- **x86/x64 LEA RIP-relative** — `RIP_PSEUDO_REG` sentinel + `ConstantOp::Adrp` tracking; MOVZX/MOVSX loads; 25+ GP-writing mnemonics emit proper `Kill`
+- **Switch table reconstruction** — `detect_switch_dispatches` on x86/x64 PIC (`lea rcx,[rip+table]` → `movsxd` → `add` → `jmp`) and ARM32
+- **Static field annotation** — all architectures: `// TypeName.fieldName` from typeinfo + static-fields offset chains (x86 RIP-relative included)
+- **Init-check suppression** — x86/x64 `movzx`/`test`/`jne`/`call runtime_class_init` pattern folded to `// [init check]`
+- **x86 gap fixes** — LEA base+disp propagation, XADD/MOVBE/BMI2/MUL/DIV RDX:RAX kill coverage
+
+> Deep dives: [`STATIC_FIELD_UPGRADE.md`](STATIC_FIELD_UPGRADE.md) · [`DISASSEMBLER_UPGRADE.md`](DISASSEMBLER_UPGRADE.md)
+
 ### What's new in v5.5
 - 🔐 Il2CppType byte-stream XOR decryption for CODM (recovers Quaternion/Vector3/Class fields previously shown as `UnknownType(0x27)` or `object`)
 - 🍎 Fixed iOS Mach-O chained-fixup edge cases — first-pointer rebasing now works on CODM iOS builds
@@ -215,7 +238,7 @@ il2cpp_dumper UnityFramework global-metadata.dat
     ╦╦  ╔═╗╔═╗╔═╗  ╔╦╗╦ ╦╔╦╗╔═╗╔═╗╦═╗
     ║║  ╠═╝║  ╠═╝   ║║║ ║║║║╠═╝║╣ ╠╦╝
     ╩╩═╝╚  ╚═╝╩    ═╩╝╚═╝╩ ╩╩  ╚═╝╩╚═
-    Version v0.5.5
+    Version v0.6.0
   ─────────────────────────────────────
 
   📂 Output .\Dump0
@@ -256,31 +279,37 @@ il2cpp_dumper UnityFramework global-metadata.dat
 
 ## ⚙️ Configuration
 
-Create a `config.json` in the working directory (or use `--config`):
+Place `config.json` next to the binary (or pass `--config path/to/config.json`). All keys use **camelCase** (see bundled [`config.json`](config.json)).
 
+### CLI flags (override config)
+| Flag | Effect |
+|------|--------|
+| `--codm` | Force CODM metadata layout + reloc/fixup paths |
+| `--force-dump` | Treat input as a memory dump; prompt for image base |
+| `--dump-static-metadata` | Enable thread-static / FieldRVA export pipeline |
+| `--no-dump-static-metadata` | Disable static metadata export |
+
+### Key groups
+
+| Group | Keys |
+|-------|------|
+| **Output** | `dumpMethod`, `dumpField`, `dumpProperty`, `dumpAttribute`, `dumpMethodOffset`, `dumpFieldOffset`, `dumpTypeDefIndex`, `dumpAssemblyName`, `splitDumpPerType` |
+| **Generation** | `generateStruct`, `generateDummyDll`, `dummyDllAddToken`, `requireAnyKey` |
+| **Generics** | `generateGenericsDump`, `dumpGenericsRgctx`, `dumpGenericsMethodSpecs`, `dumpGenericsCustomAttributes`, `dumpGenericsStringLiterals`, `dumpGenericsMetadataUsages`, `dumpGenericsVtables`, `dumpGenericsInterfaces` |
+| **Disassembly** | `dumpDisassembly`, `dumpDisassemblyTarget` (0=Both, 1=dump.cs, 2=DiffableCs), `dumpDisassemblyHexBytes`, `dumpDisassemblyFieldNames`, `dumpDisassemblyAnnotations`, `dumpDisassemblyCfg`, `maxDisassemblyInstructions` |
+| **C++ headers** | `generateCppScaffold`, `mangleNames`, `enhancedIdaMetadata`, `generateUnityHeaders`, `compilerLayout` (`GCC`/`MSVC`), `useTopologicalSort` |
+| **Static metadata (v6)** | `dumpStaticFieldMetadata` (default `false`), `dumpFieldRvaData`, `maxFieldRvaDumpBytes` |
+| **Advanced** | `forceIl2cppVersion`, `forceVersion`, `forceDump`, `noRedirectedPointer`, `codm` |
+
+### v6 static metadata example
 ```json
 {
-  "ForceIl2CppVersion": false,
-  "ForceVersion": 29.0,
-  "ForceDump": false,
-  "NoRedirectedPointer": false,
-  "GenerateStruct": true,
-  "GenerateDummyDll": true,
-  "DummyDllAddToken": true,
-  "dumpDisassembly": false,
-  "dumpDisassemblyHexBytes": true,
-  "dumpDisassemblyFieldNames": true,
-  "dumpDisassemblyAnnotations": true,
-  "dumpDisassemblyCfg": true,
-  "maxDisassemblyInstructions": 512,
-  "generateCppScaffold": true,
-  "mangleNames": true,
-  "enhancedIdaMetadata": true,
-  "generateUnityHeaders": true,
-  "compilerLayout": "GCC",
-  "useTopologicalSort": true
+  "dumpStaticFieldMetadata": true,
+  "dumpFieldRvaData": false,
+  "maxFieldRvaDumpBytes": 4096
 }
 ```
+When enabled, outputs `static_metadata.json` and enriches dump.cs / DummyDll / script.json. Set `dumpFieldRvaData` to `true` only when you need base64 hex blobs in JSON (can be tens of MB on large games). Leave the master toggle **off** for faster dumps when you only need `dump.cs`.
 
 ---
 
@@ -297,8 +326,9 @@ il2cpp_dumper/src/
 │   ├── nso.rs                        # NSO (Nintendo Switch)
 │   └── wasm.rs                       # WebAssembly (WebGL)
 ├── il2cpp/                           # IL2CPP structures and metadata
-│   ├── base.rs                       # Il2Cpp main struct
-│   ├── metadata.rs                   # Metadata parser
+│   ├── base.rs                       # Il2Cpp main struct, type_definition_sizes
+│   ├── field_layout.rs               # Thread-static / FieldRVA offset decode (v6)
+│   ├── metadata.rs                   # Metadata parser (+ CODM variant)
 │   └── structures.rs                 # IL2CPP type definitions
 ├── search/                           # Registration search algorithms
 │   └── section_helper.rs
@@ -309,7 +339,8 @@ il2cpp_dumper/src/
 │   └── x86.rs                        # x86/x64 decoder (iced-x86)
 └── output/                           # Output generators
     ├── decompiler.rs                 # dump.cs + inline disassembly
-    ├── struct_generator.rs           # script.json, il2cpp.h, type classification
+    ├── static_field_exporter.rs      # static_metadata.json + field annotations (v6)
+    ├── struct_generator.rs           # script.json, il2cpp.h, v27 FieldRva scan
     ├── dummy_assembly_generator.rs   # DummyDLL (parallel)
     ├── cpp_scaffolding.rs            # il2cpp-functions.h generation
     ├── cpp_ast.rs                    # C++ AST emission with group annotations

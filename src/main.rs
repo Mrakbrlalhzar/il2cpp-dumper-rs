@@ -48,12 +48,41 @@ const BANNER: &str = r#"
 #[derive(Parser)]
 #[command(name = "il2cpp_dumper", version, about = "IL2CPP Dumper - Rust Port")]
 struct Cli {
-    il2cpp_binary: String,
-    metadata: String,
-    #[arg(default_value = ".")]
-    output_dir: String,
-    #[arg(long)]
+    #[arg(long = "binary", short = 'b')]
+    il2cpp_binary_flag: Option<String>,
+    #[arg(long = "metadata", short = 'm')]
+    metadata_flag: Option<String>,
+    #[arg(long = "output", short = 'o')]
+    output_dir_flag: Option<String>,
+    #[arg(long = "config", short = 'c')]
     config: Option<String>,
+    #[arg(long = "codm")]
+    codm: bool,
+    /// Export thread-static / FieldRVA metadata (`static_metadata.json`, dump.cs annotations).
+    #[arg(long = "dump-static-metadata")]
+    dump_static_metadata: bool,
+    /// Skip thread-static / FieldRVA static metadata export.
+    #[arg(long = "no-dump-static-metadata")]
+    no_dump_static_metadata: bool,
+    #[arg(long = "force-dump")]
+    force_dump: bool,
+    #[arg(num_args = 0..=3)]
+    positional: Vec<String>,
+}
+
+impl Cli {
+    fn resolve(&self) -> std::result::Result<(String, String, String), String> {
+        let binary = self.il2cpp_binary_flag.clone()
+            .or_else(|| self.positional.get(0).cloned())
+            .ok_or_else(|| "missing il2cpp binary path (positional or --binary)".to_string())?;
+        let metadata = self.metadata_flag.clone()
+            .or_else(|| self.positional.get(1).cloned())
+            .ok_or_else(|| "missing metadata path (positional or --metadata)".to_string())?;
+        let output = self.output_dir_flag.clone()
+            .or_else(|| self.positional.get(2).cloned())
+            .unwrap_or_else(|| ".".into());
+        Ok((binary, metadata, output))
+    }
 }
 
 fn spinner(msg: &str) -> ProgressBar {
@@ -362,6 +391,10 @@ fn prompt_manual_addresses() -> Result<(u64, u64)> {
     Ok((cr, mr))
 }
 
+fn resolve_codm(config: &Config, metadata: &Metadata) -> bool {
+    config.codm || metadata.variant == MetadataVariant::Codm
+}
+
 fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
     let is_64 = data.len() > 4 && data[4] == 2;
     print_detection(&format!("ELF{} format", if is_64 { "64" } else { "32" }));
@@ -441,6 +474,7 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
 
     let elf_exports = elf.list_exported_symbols().unwrap_or_default();
     let mut il2cpp = Il2Cpp::from_elf(&elf);
+    il2cpp.codm = il2cpp.codm || resolve_codm(config, metadata);
     il2cpp.exported_symbols = elf_exports.iter().map(|(n, _)| n.clone()).collect();
     for (name, addr) in elf_exports {
         if name.starts_with("il2cpp_") || name.starts_with("mono_") {
@@ -523,13 +557,14 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     il2cpp.va_segments = va_segments;
     il2cpp.image_base = pe_image_base;
     il2cpp.is_pe = true;
-    il2cpp.codm = config.codm;
+    il2cpp.codm = resolve_codm(config, metadata);
     il2cpp.arch = Some(if pe.is_32bit {
         il2cpp_dumper::disassembler::Architecture::X86
     } else {
         il2cpp_dumper::disassembler::Architecture::X64
     });
     il2cpp.init(cr_addr, mr_addr, &|addr| pe.map_vatr(addr))?;
+    il2cpp.data_sections = pe.data_search_sections();
     if let Ok(exports) = pe.list_exported_symbols() {
         il2cpp.exported_symbols = exports.iter().map(|(n, _)| n.clone()).collect();
         for (name, rva) in exports {
@@ -653,10 +688,40 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
         }
     }).collect();
 
-    let mut il2cpp = Il2Cpp::new(macho.stream.clone(), version, macho.is_32bit);
-    il2cpp.va_segments = va_segments;
-    il2cpp.codm = config.codm;
-    il2cpp.init(cr_addr, mr_addr, &|addr| macho.map_vatr(addr))?;
+    // Helper: try a (cr, mr) pair with il2cpp.init and tell the caller
+    // whether it actually parsed cleanly. The auto-detection on Mach-O
+    // sometimes lands on byte-pattern false positives that look right
+    // (matching type_count somewhere in __DATA_CONST) but blow up the
+    // moment we dereference the struct's pointer fields -- typically
+    // surfacing as "failed to fill whole buffer" when read_exact runs
+    // past EOF. Catching that here lets us prompt the user for known-
+    // good addresses (e.g. extracted from IDA) instead of dying.
+    let try_init = |cr: u64, mr: u64| -> Result<Il2Cpp> {
+        let mut il2cpp = Il2Cpp::new(macho.stream.clone(), version, macho.is_32bit);
+        il2cpp.va_segments = va_segments.clone();
+        il2cpp.codm = resolve_codm(config, metadata);
+        il2cpp.init(cr, mr, &|addr| macho.map_vatr(addr))?;
+        Ok(il2cpp)
+    };
+
+    let mut il2cpp = match try_init(cr_addr, mr_addr) {
+        Ok(i) => i,
+        Err(e) => {
+            print_warn(&format!(
+                "Auto-detected CodeRegistration / MetadataRegistration failed to parse ({}). \
+                 Likely a byte-pattern false positive. Please enter the correct addresses \
+                 (e.g. from IDA / Ghidra cross-references on s_Il2CppCodeRegistration / \
+                 s_Il2CppMetadataRegistration).",
+                e
+            ));
+            let (cr2, mr2) = prompt_manual_addresses()?;
+            cr_addr = cr2;
+            mr_addr = mr2;
+            try_init(cr_addr, mr_addr)?
+        }
+    };
+
+    il2cpp.data_sections = macho.data_search_sections();
 
     if macho.is_32bit {
         for ptr in il2cpp.method_pointers.iter_mut() {
@@ -714,8 +779,9 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     let stream_len = nso.stream.data().len() as u64;
     let mut il2cpp = Il2Cpp::new(nso.stream.clone(), version, nso.is_32bit);
     il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
-    il2cpp.codm = config.codm;
+    il2cpp.codm = resolve_codm(config, metadata);
     il2cpp.init(cr_addr, mr_addr, &|addr| nso.map_vatr(addr))?;
+    il2cpp.data_sections = nso.data_search_sections();
 
     if let Ok(nso_exports) = nso.list_exported_symbols() {
         il2cpp.exported_symbols = nso_exports.iter().map(|(n, _)| n.clone()).collect();
@@ -765,8 +831,9 @@ fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2C
     let stream_len = wasm.stream.data().len() as u64;
     let mut il2cpp = Il2Cpp::new(wasm.stream.clone(), version, wasm.is_32bit);
     il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
-    il2cpp.codm = config.codm;
+    il2cpp.codm = resolve_codm(config, metadata);
     il2cpp.init(cr_addr, mr_addr, &|addr| wasm.map_vatr(addr))?;
+    il2cpp.data_sections = wasm.data_search_sections();
     Ok(il2cpp)
 }
 
@@ -803,10 +870,12 @@ fn format_file_size(bytes: u64) -> String {
 fn run() -> Result<()> {
     let start_time = Instant::now();
     let cli = Cli::parse();
+    let (il2cpp_binary_path, metadata_path, output_dir_arg) = cli.resolve()
+        .map_err(il2cpp_dumper::error::Error::Other)?;
 
     print_banner();
 
-    let config = if let Some(config_path) = &cli.config {
+    let mut config = if let Some(config_path) = &cli.config {
         Config::load_from_file(config_path).unwrap_or_else(|e| {
             print_warn(&format!("Failed to load config from {}: {}", config_path, e));
             Config::default()
@@ -820,7 +889,12 @@ fn run() -> Result<()> {
         Config::default()
     };
 
-    let base_dir = std::path::Path::new(&cli.output_dir);
+    if cli.codm { config.codm = true; }
+    if cli.dump_static_metadata { config.dump_static_field_metadata = true; }
+    if cli.no_dump_static_metadata { config.dump_static_field_metadata = false; }
+    if cli.force_dump { config.force_dump = true; }
+
+    let base_dir = std::path::Path::new(&output_dir_arg);
     let mut dump_num = 0u32;
     while base_dir.join(format!("Dump{dump_num}")).exists() {
         dump_num += 1;
@@ -842,12 +916,12 @@ fn run() -> Result<()> {
     println!();
 
     let sp = spinner("Loading IL2CPP binary...");
-    let il2cpp_bytes = fs::read(&cli.il2cpp_binary)?;
+    let il2cpp_bytes = fs::read(&il2cpp_binary_path)?;
     let binary_size = il2cpp_bytes.len() as u64;
     sp.finish_and_clear();
     print_success(&format!(
         "Binary loaded: {} ({})",
-        style(&cli.il2cpp_binary).white().bold(),
+        style(&il2cpp_binary_path).white().bold(),
         style(format_file_size(binary_size)).cyan()
     ));
 
@@ -857,12 +931,12 @@ fn run() -> Result<()> {
     }
 
     let sp = spinner("Loading metadata...");
-    let mut metadata_bytes = fs::read(&cli.metadata)?;
+    let mut metadata_bytes = fs::read(&metadata_path)?;
     let metadata_size = metadata_bytes.len() as u64;
     sp.finish_and_clear();
     print_success(&format!(
         "Metadata loaded: {} ({})",
-        style(&cli.metadata).white().bold(),
+        style(&metadata_path).white().bold(),
         style(format_file_size(metadata_size)).cyan()
     ));
 
@@ -947,9 +1021,32 @@ fn run() -> Result<()> {
 
     let mut generated_files: Vec<String> = vec!["dump.cs".into()];
 
+    let static_catalog = if config.dump_static_field_metadata {
+        let sp = spinner("Analyzing thread-static / FieldRVA metadata...");
+        let catalog = il2cpp_dumper::output::static_field_exporter::StaticFieldCatalog::collect(
+            &mut executor, &mut metadata, &mut il2cpp, &config,
+        )?;
+        il2cpp_dumper::output::static_field_exporter::StaticFieldExporter::write_document(
+            &catalog, &il2cpp, &output_dir,
+        )?;
+        sp.finish_and_clear();
+        print_success(&format!(
+            "static_metadata.json generated ({} thread-static, {} FieldRVA)",
+            catalog.summary.thread_static_count,
+            catalog.summary.field_rva_count,
+        ));
+        generated_files.push("static_metadata.json".into());
+        Some(catalog)
+    } else {
+        None
+    };
+
     if config.generate_struct {
         let sp = spinner("Generating structs...");
-        StructGenerator::write_all(&mut executor, &mut metadata, &mut il2cpp, &config, &output_dir)?;
+        StructGenerator::write_all(
+            &mut executor, &mut metadata, &mut il2cpp, &config, &output_dir,
+            static_catalog.as_ref(),
+        )?;
         il2cpp_dumper::output::embedded_scripts::write_scripts(std::path::Path::new(&output_dir))?;
         sp.finish_and_clear();
         print_success("script.json, il2cpp.h, il2cpp-functions.h, stringliteral.json generated");
